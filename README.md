@@ -17,7 +17,9 @@ The returning page displays the Order ID as soon as ViewEditFI creates the order
 
 Both pages include expandable **Create order** and **Capture** panels showing the backend's PayPal REST method, URL, safe headers, JSON request body, response HTTP status, and full response body. Errors are shown too. Capture details appear only after a capture is requested; direct saved-method payments identify that no separate capture call was sent and show the payment result in Create order.
 
-Traces are retained with the checkout for retries and reloads. Orders created before this tracing feature may not have their original responses available; start a new purchase to record both steps. OAuth exchanges and Authorization headers are excluded, and credentials, tokens, and sensitive fields are redacted before traces are stored or returned.
+Traces are retained with the checkout for retries and reloads. New create/capture calls display the used Bearer authorization method and exact access token in `request.authentication`, together with the actual `Authorization` header. These values appear only in the immediate response on the Basic-authenticated test pages and remain in that page's memory while it is open. Saved traces redact token values; after a reload, start a new request to see its used token. The page preserves each call's own token when later responses refresh the panels.
+
+OAuth exchanges, client secrets, site passwords, and other sensitive response fields remain excluded or redacted. Tokens are not written to browser storage or activity logs. Orders created before tracing was introduced may not have their original responses available; start a new purchase to record both steps.
 
 ## Deploy this repository to Cloudflare
 
@@ -147,7 +149,7 @@ If the buyer keeps the saved method, the separate place-order button calls the s
 - Only a completed new-customer payment replaces the buyer. An abandoned/failed checkout preserves the previous buyer. Old capture callbacks cannot overwrite a newer successful checkout.
 - Every returning token/order/capture is checked against the cache revision. A page opened before another buyer replaced the cache must reload.
 - Duplicate clicks, retries, and interrupted responses reuse stable `PayPal-Request-Id` values. The exact request payload is persisted before a create call. An unresolved create older than five hours is blocked to avoid retrying after PayPal's default idempotency window may have elapsed.
-- Browser session storage holds request UUIDs only. The vault ID is stored server-side. The REST secret/access token never goes to the browser; the vault-scoped client token is supplied only for SDK initialization and is omitted from activity logs.
+- Browser session storage holds request UUIDs only. The vault ID is stored server-side. The REST app secret stays on the server. The used Bearer access token is displayed in the protected request panels for new calls and redacted from saved history; the vault-scoped client token is supplied only for SDK initialization. Neither token is written to browser storage or activity logs.
 - Authentication runs before every HTML, JS, CSS, and API response. Mutating browser API calls also require a same-origin request marker. All responses use `Cache-Control: no-store`.
 
 ### Optional: asynchronous vault completion

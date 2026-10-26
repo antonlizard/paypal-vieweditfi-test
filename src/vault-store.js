@@ -181,14 +181,14 @@ export class VaultStore {
       // response is lost or the object restarts, retry the same PayPal request.
       await this.storage.put(key, operation);
     }
-    const order = await this.paymentRequest(operation, "create", "/v2/checkout/orders", {
+    const { order, trace } = await this.paymentRequest(operation, "create", "/v2/checkout/orders", {
       method: "POST", body: operation.payload, requestId: `create-${operation.requestId}`,
     });
-    if (!ORDER_ID.test(order.id || "")) throw new AppError(502, "INVALID_ORDER_RESPONSE", "PayPal did not return an order ID.", { traces: operation.traces });
+    if (!ORDER_ID.test(order.id || "")) throw new AppError(502, "INVALID_ORDER_RESPONSE", "PayPal did not return an order ID.", { traces: { ...operation.traces, create: trace } });
     operation.orderId = order.id;
     operation.result = summary(order);
     await this.finish(operation, order);
-    return json({ order: operation.result, traces: operation.traces });
+    return json({ order: operation.result, traces: { ...operation.traces, create: trace } });
   }
 
   async paymentRequest(operation, kind, path, init) {
@@ -196,15 +196,20 @@ export class VaultStore {
     operation.traces ||= {};
     try {
       const result = await this.paypal.api(path, { ...init, trace });
-      operation.traces[kind] = trace;
+      // Retain request/response history without retaining usable credentials.
+      // Only the response to this authenticated action contains the used token.
+      operation.traces[kind] = this.paypal.safeTrace(trace);
       await this.storage.put(`operation:${operation.requestId}`, operation);
-      return result;
+      return { order: result, trace };
     } catch (error) {
-      operation.traces[kind] = trace;
+      operation.traces[kind] = this.paypal.safeTrace(trace);
       await this.storage.put(`operation:${operation.requestId}`, operation);
       if (error instanceof AppError) {
         error.message = this.paypal.safeTrace(error.message);
-        error.details = this.paypal.safeTrace({ ...error.details, traces: operation.traces });
+        error.details = {
+          ...this.paypal.safeTrace(error.details),
+          traces: { ...operation.traces, [kind]: trace },
+        };
       }
       throw error;
     }
@@ -220,12 +225,17 @@ export class VaultStore {
       throw new AppError(409, "DIRECT_ORDER", "Direct charges are processed by create order. Check their status instead of capturing again.");
     }
     const path = `/v2/checkout/orders/${orderId}`;
-    const order = capture ? await this.paymentRequest(operation, "capture", `${path}/capture`, {
+    const captured = capture ? await this.paymentRequest(operation, "capture", `${path}/capture`, {
       method: "POST", body: {}, requestId: `capture-${orderId}`,
-    }) : await this.paypal.api(path);
+    }) : null;
+    const order = captured ? captured.order : await this.paypal.api(path);
     operation.result = summary(order);
     await this.finish(operation, order);
-    return json({ order: operation.result, traces: operation.traces || {}, buyer: publicBuyer(await this.storage.get("current")) });
+    return json({
+      order: operation.result,
+      traces: { ...operation.traces, ...(captured ? { capture: captured.trace } : {}) },
+      buyer: publicBuyer(await this.storage.get("current")),
+    });
   }
 
   async finish(operation, order) {

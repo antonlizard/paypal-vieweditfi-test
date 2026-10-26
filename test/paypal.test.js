@@ -60,7 +60,7 @@ for (const scenario of [
   });
 }
 
-test("payment traces retain REST bodies while redacting credentials and tokens recursively", async () => {
+test("live request traces show the used Bearer token while stored traces redact credentials", async () => {
   const trace = {};
   const settings = { ...env, BASIC_AUTH_PASSWORD: "private-site-password" };
   const raw = {
@@ -81,7 +81,14 @@ test("payment traces retain REST bodies while redacting credentials and tokens r
   assert.equal(trace.response.body.payment_source.paypal.vault_id, "visible-vault-id");
   assert.equal(trace.request.body.client_secret, "[REDACTED]");
   assert.equal(trace.response.headers["paypal-debug-id"], "safe-debug");
-  const serialized = JSON.stringify(trace);
+  assert.deepEqual(trace.request.authentication, { method: "Bearer", token: "server-access-token" });
+  assert.equal(trace.request.headers.Authorization, "Bearer server-access-token");
+  assert.equal(trace.response.body.diagnostic.includes("server-access-token"), false);
+  const stored = paypal.safeTrace(trace);
+  assert.equal(stored.request.authentication.method, "Bearer");
+  assert.equal(stored.request.authentication.token, "[REDACTED]");
+  assert.equal(stored.request.headers.Authorization, "[REDACTED]");
+  const serialized = JSON.stringify(stored);
   for (const secret of [settings.PAYPAL_CLIENT_SECRET, settings.BASIC_AUTH_PASSWORD, "server-access-token", "arbitrary-secret", "private-sdk-token", "private-token", "another-password", "request-secret", "private-cookie"]) {
     assert.equal(serialized.includes(secret), false, secret);
   }
@@ -94,6 +101,7 @@ test("failed OAuth is not exposed as an Orders response or an attempted Orders c
   assert.equal(trace.attempted, false);
   assert.equal(trace.response, null);
   assert.equal(trace.request.url, "https://api-m.sandbox.paypal.com/v2/checkout/orders");
+  assert.deepEqual(trace.request.authentication, { method: "Bearer", token: null });
   assert.equal(JSON.stringify(trace).includes(env.PAYPAL_CLIENT_SECRET), false);
 });
 

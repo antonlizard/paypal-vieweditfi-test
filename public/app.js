@@ -2,6 +2,7 @@ const $ = (id) => document.getElementById(id);
 const flow = document.body.dataset.flow;
 let settings, buyer, mounted = false, busy = false, paid = false, unresolved = false, lastOrderId, approvedOrderId, submittingPayment = false;
 const activity = [];
+const displayedAuthorizations = new Map();
 const context = () => flow === "new" ? "new" : `returning:${buyer?.revision}`;
 const storageKey = (kind) => `editfi:${context()}:${kind}`;
 const placeOrderPrompt = 'Payment method approved. Click "Place order with saved method" to complete the purchase.';
@@ -17,6 +18,7 @@ function status(message, type = "") {
 }
 
 function resetApiTraces() {
+  displayedAuthorizations.clear();
   for (const kind of ["create", "capture"]) {
     $(`${kind}-trace`).open = false;
     $(`${kind}-trace-status`).textContent = "Not requested";
@@ -31,7 +33,18 @@ function showApiTraces(traces) {
     if (!trace) continue;
     $(`${kind}-trace`).open = true;
     $(`${kind}-trace-status`).textContent = trace.response ? `HTTP ${trace.response.status}` : trace.attempted ? "No response" : "Not sent";
-    $(`${kind}-request`).textContent = JSON.stringify(trace.request, null, 2);
+    const request = { ...trace.request, headers: { ...trace.request.headers }, authentication: { ...trace.request.authentication } };
+    const key = `${request.url}:${request.headers["PayPal-Request-Id"]}`;
+    const token = request.authentication.token;
+    if (typeof token === "string" && token !== "[REDACTED]") displayedAuthorizations.set(key, token);
+    const usedToken = displayedAuthorizations.get(key);
+    if (usedToken) {
+      request.authentication.token = usedToken;
+      request.headers.Authorization = `Bearer ${usedToken}`;
+    } else if (request.authentication.token === "[REDACTED]") {
+      request.authentication.token = "Not retained. Send a new request to display its token.";
+    }
+    $(`${kind}-request`).textContent = JSON.stringify(request, null, 2);
     $(`${kind}-response`).textContent = JSON.stringify(trace.response || { error: trace.error || "No response received." }, null, 2);
   }
   if (traces.create?.request?.body?.payment_source?.paypal?.vault_id && !traces.capture) {
@@ -55,7 +68,9 @@ function showError(error) {
   busy = false;
   const extra = error.details?.debugId ? ` (PayPal debug ID: ${error.details.debugId})` : "";
   status(`${error.message}${extra}`, "error");
-  log("Error", { code: error.code, message: error.message, details: error.details });
+  const details = error.details ? { ...error.details } : undefined;
+  if (details) delete details.traces; // Tokens belong only in the request panel.
+  log("Error", { code: error.code, message: error.message, details });
   controls();
 }
 

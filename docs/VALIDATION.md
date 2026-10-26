@@ -8,7 +8,7 @@ Validated locally on 2026-10-27 with Node.js 24.22.1.
 - A receiver-sensitive fetch regression test reproduces the original adapter's failure and verifies OAuth, Orders, and scoped-token requests use the Worker global receiver. Error tests distinguish network, timeout, abort, and invocation failures without returning raw exceptions or credentials.
 - Frontend checks verify that the returning checkout shows the Order ID on creation and the completed capture's Transaction ID after payment, including direct-payment recovery and a pending capture transitioning to completion.
 - Returning-customer approval makes no capture call. Tests verify capture only after Place order, direct payment when there was no edit, repeated edits, cancellation, duplicate clicks, reload/redirect recovery, and lost capture responses. The new-customer flow still captures after approval.
-- Trace tests compare displayed requests/responses with the actual PayPal HTTP calls, verify persistence and replay, cover failed captures and non-JSON errors, and ensure OAuth data, authentication headers, secrets, and tokens are not exposed. Frontend checks cover separate create/capture panels, errors, and direct payment without a fabricated capture call.
+- Trace tests compare displayed requests/responses with the actual PayPal HTTP calls, verify persistence and replay, and cover failed captures and non-JSON errors. New calls display their exact Bearer authorization in the protected debug response; tests verify saved traces redact it and client secrets/site passwords remain hidden. Frontend checks verify distinct create/capture tokens, page-only retention, redaction after reload, and exclusion from activity logs and browser storage.
 
 Not verified in this session:
 

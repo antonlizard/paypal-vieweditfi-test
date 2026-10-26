@@ -7,13 +7,14 @@ const source = await readFile(new URL("../public/app.js", import.meta.url), "utf
 const savedBuyer = { revision: "revision-1", vaultId: "server-vault-1", state: "VAULTED", savedAt: new Date().toISOString() };
 const complete = { id: "ORDER00001", status: "COMPLETED", completed: true, purchase_units: [{ payments: { captures: [{ id: "CAPTURE00001", status: "COMPLETED" }] } }] };
 const createTrace = {
-  request: { method: "POST", url: "https://api-m.sandbox.paypal.com/v2/checkout/orders", headers: { "PayPal-Request-Id": "create-test" }, body: { intent: "CAPTURE", purchase_units: [{ amount: { currency_code: "EUR", value: "10.00" } }] } },
+  request: { method: "POST", url: "https://api-m.sandbox.paypal.com/v2/checkout/orders", headers: { "PayPal-Request-Id": "create-test", Authorization: "Bearer create-access-token" }, authentication: { method: "Bearer", token: "create-access-token" }, body: { intent: "CAPTURE", purchase_units: [{ amount: { currency_code: "EUR", value: "10.00" } }] } },
   response: { status: 201, headers: {}, body: { id: complete.id, status: "PAYER_ACTION_REQUIRED" } }, attempted: true,
 };
 const captureTrace = {
-  request: { method: "POST", url: `https://api-m.sandbox.paypal.com/v2/checkout/orders/${complete.id}/capture`, headers: {}, body: {} },
+  request: { method: "POST", url: `https://api-m.sandbox.paypal.com/v2/checkout/orders/${complete.id}/capture`, headers: { "PayPal-Request-Id": "capture-test", Authorization: "Bearer capture-access-token" }, authentication: { method: "Bearer", token: "capture-access-token" }, body: {} },
   response: { status: 201, headers: {}, body: complete }, attempted: true,
 };
+const savedCreateTrace = { ...createTrace, request: { ...createTrace.request, headers: { ...createTrace.request.headers, Authorization: "[REDACTED]" }, authentication: { method: "Bearer", token: "[REDACTED]" } } };
 
 // This exercises browser event logic and SDK configuration with a fake DOM and
 // PayPal SDK. It is a contract test, not visual/browser or real-PayPal testing.
@@ -56,7 +57,7 @@ function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, has
       if (path === "/api/state") return Response.json({ buyer: initialBuyer });
       if (path === "/api/client-token") return Response.json({ clientToken: "scoped-test-token", expiresIn: 32400 });
       if (path === "/api/orders") return Response.json({ order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" }, traces: { create: createTrace } });
-      if (path.endsWith("/capture")) return Response.json({ order: complete, traces: { create: createTrace, capture: captureTrace } });
+      if (path.endsWith("/capture")) return Response.json({ order: complete, traces: { create: savedCreateTrace, capture: captureTrace } });
       if (path === "/api/direct-charge") return Response.json({ order: complete, traces: { create: {
         ...createTrace,
         request: { ...createTrace.request, body: { intent: "CAPTURE", payment_source: { paypal: { vault_id: savedBuyer.vaultId } } } },
@@ -120,6 +121,8 @@ test("returning approval waits for Place order, which captures the approved orde
   assert.equal(page.element("create-trace").open, true);
   assert.equal(page.element("create-trace-status").textContent, "HTTP 201");
   assert.deepEqual(JSON.parse(page.element("create-request").textContent), createTrace.request);
+  assert.equal(JSON.parse(page.element("create-request").textContent).authentication.method, "Bearer");
+  assert.equal(JSON.parse(page.element("create-request").textContent).authentication.token, "create-access-token");
   assert.deepEqual(JSON.parse(page.element("create-response").textContent).body, createTrace.response.body);
   assert.equal(page.element("capture-trace-status").textContent, "Not requested");
   await page.callbacks.onApprove({ orderID: complete.id });
@@ -137,6 +140,10 @@ test("returning approval waits for Place order, which captures the approved orde
   assert.equal(page.element("capture-trace").open, true);
   assert.deepEqual(JSON.parse(page.element("capture-request").textContent).body, {});
   assert.equal(JSON.parse(page.element("capture-response").textContent).body.purchase_units[0].payments.captures[0].id, "CAPTURE00001");
+  assert.equal(JSON.parse(page.element("create-request").textContent).authentication.token, "create-access-token");
+  assert.equal(JSON.parse(page.element("capture-request").textContent).authentication.token, "capture-access-token");
+  assert.equal(page.element("activity").textContent.includes("capture-access-token"), false);
+  assert.equal(JSON.stringify([...page.storage]).includes("access-token"), false);
   assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
   assert.equal(page.requests.filter((request) => request.path === "/api/direct-charge").length, 0);
 });
@@ -207,6 +214,8 @@ test("a failed create displays the REST request and error response without attem
   assert.equal(JSON.parse(page.element("create-request").textContent).body.intent, "CAPTURE");
   assert.equal(JSON.parse(page.element("create-response").textContent).body.name, "UNPROCESSABLE_ENTITY");
   assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+  assert.equal(JSON.parse(page.element("create-request").textContent).authentication.token, "create-access-token");
+  assert.equal(page.element("activity").textContent.includes("create-access-token"), false);
 });
 
 test("a further edit creates a fresh order and Place order captures only the latest approval", async () => {
@@ -248,11 +257,13 @@ test("reload restores an approved order without charging until Place order", asy
   await first.callbacks.createOrder();
   await first.callbacks.onApprove({ orderID: complete.id });
   const restored = browser("returning", (path) => {
-    if (path.startsWith("/api/operations/")) return { order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" } };
-    if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "APPROVED" } };
+    if (path.startsWith("/api/operations/")) return { order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" }, traces: { create: savedCreateTrace } };
+    if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "APPROVED" }, traces: { create: savedCreateTrace } };
   }, savedBuyer, true, { storage: first.storage });
   await restored.ready();
   assert.equal(restored.element("payment-order-id").textContent, complete.id);
+  assert.match(JSON.parse(restored.element("create-request").textContent).authentication.token, /Not retained/);
+  assert.equal(restored.element("create-request").textContent.includes("create-access-token"), false);
   assert.equal(restored.element("place-order").disabled, false);
   assert.equal(restored.requests.some((request) => request.path.endsWith("/capture") || request.path === "/api/direct-charge"), false);
   await restored.element("place-order").events.click();
