@@ -15,20 +15,20 @@ Both pages display the shared saved buyer and an expandable activity panel. The 
 
 ## Deploy this repository to Cloudflare
 
-Source repository: [antonlizard/paypal-editfi-test](https://github.com/antonlizard/paypal-editfi-test).
+Source repository: [antonlizard/paypal-vieweditfi-test](https://github.com/antonlizard/paypal-vieweditfi-test).
 
 To work on the code locally:
 
 ```sh
-git clone https://github.com/antonlizard/paypal-editfi-test.git
-cd paypal-editfi-test
+git clone https://github.com/antonlizard/paypal-vieweditfi-test.git
+cd paypal-vieweditfi-test
 ```
 
 In the Cloudflare dashboard:
 
 1. Open **Workers & Pages**, create a new Worker, and choose the option to import/connect a Git repository.
 2. Authorize Cloudflare's GitHub integration for this repository and select it.
-3. Set the Worker name to **`paypal-editfi-test`**, matching `wrangler.jsonc`.
+3. Set the Worker name to **`paypal-vieweditfi-test`**, matching `wrangler.jsonc`.
 4. Use the following build configuration:
 
    | Setting | Value |
@@ -49,8 +49,11 @@ In the Cloudflare dashboard:
    | `PAYPAL_CLIENT_SECRET` | Secret | The same REST app's secret |
    | `BASIC_AUTH_USERNAME` | Text or Secret | Your chosen test-site login name, for example `editfi` |
    | `BASIC_AUTH_PASSWORD` | Secret | A long random test-site password |
+   | `PAYPAL_ENV` | Text | Optional: `sandbox` (the only supported environment) |
+   | `PAYPAL_CURRENCY` | Text | Optional: for example `EUR`; defaults to `USD` if unset |
+   | `PAYPAL_AMOUNT` | Text | Optional: for example `10.00`; defaults to `10.00` if unset |
 
-   `keep_vars: true` preserves dashboard-managed variables across Wrangler deployments. The versioned defaults `PAYPAL_ENV=sandbox`, `PAYPAL_CURRENCY=USD`, and `PAYPAL_AMOUNT=10.00` are in `wrangler.jsonc`; edit that file to change the test amount/currency. This application rejects live configuration.
+   Runtime variables are managed in the Cloudflare dashboard. `wrangler.jsonc` deliberately leaves `vars` undeclared and uses `keep_vars: true` so Git deployments preserve those dashboard values, including your chosen currency and amount. Cloudflare may show a configuration-sync notice after dashboard edits; that notice is informational for this setup. The application supplies sandbox / USD / 10.00 fallbacks if the optional values are unset and rejects live configuration.
 
 7. Visit your returned `https://…workers.dev/new-customer` URL and enter the HTTP Basic credentials when prompted.
 8. Push future changes to `main`; Cloudflare's Git integration builds and deploys them automatically.

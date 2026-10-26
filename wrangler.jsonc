@@ -16,10 +16,5 @@
     "bindings": [{ "name": "VAULT_STORE", "class_name": "VaultStore" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["VaultStore"] }],
-  "vars": {
-    "PAYPAL_ENV": "sandbox",
-    "PAYPAL_CURRENCY": "EUR",
-    "PAYPAL_AMOUNT": "10.00"
-  },
   "observability": { "enabled": false }
 }
