@@ -9,8 +9,8 @@ const complete = { id: "ORDER00001", status: "COMPLETED", completed: true, purch
 
 // This exercises browser event logic and SDK configuration with a fake DOM and
 // PayPal SDK. It is a contract test, not visual/browser or real-PayPal testing.
-function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, hasComponent = true) {
-  const elements = new Map(), scripts = [], renders = [], requests = [], storage = new Map();
+function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, hasComponent = true, options = {}) {
+  const elements = new Map(), scripts = [], renders = [], requests = [], storage = new Map(options.storage);
   let callbacks;
   function element(id) {
     if (!elements.has(id)) elements.set(id, {
@@ -34,7 +34,7 @@ function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, has
       head: { appendChild(script) { scripts.push(script); queueMicrotask(() => script.onload()); } },
     },
     window: { paypal },
-    location: { search: "", pathname: `/${flow === "new" ? "new" : "returning"}-customer`, reload() {} },
+    location: { search: options.search || "", pathname: `/${flow === "new" ? "new" : "returning"}-customer`, reload() {} },
     history: { replaceState() {} },
     sessionStorage: { getItem: (key) => storage.get(key) || null, setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) },
     crypto, URLSearchParams, Intl, Date,
@@ -69,8 +69,13 @@ test("new page loads SDK v5 with vaulting and only renders PayPal Buttons", asyn
   assert.equal(sdk.pathname, "/sdk/js");
   assert.equal(sdk.searchParams.get("components"), "buttons");
   assert.equal(sdk.searchParams.get("vault"), "true");
+  assert.equal(sdk.searchParams.get("commit"), "true");
   assert.deepEqual(page.renders, ["#paypal-button-container"]);
   assert.equal(page.requests.some((request) => request.path === "/api/client-token"), false);
+  await page.callbacks.createOrder();
+  await page.callbacks.onApprove({ orderID: complete.id });
+  assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
+  assert.match(page.element("status").textContent, /Payment completed/);
 });
 
 test("returning page scopes SDK through its data attribute and all four required components", async () => {
@@ -82,6 +87,7 @@ test("returning page scopes SDK through its data attribute and all four required
   assert.equal(script["data-sdk-client-token"], "scoped-test-token");
   assert.equal(sdk.searchParams.has("client-token"), false);
   assert.equal(sdk.searchParams.has("vault-id"), false);
+  assert.equal(sdk.searchParams.get("commit"), "false");
   assert.equal(page.callbacks.vaultId, undefined);
   assert.deepEqual(page.renders, ["#saved-payment-methods-container"]);
   assert.equal(page.element("place-order").disabled, false);
@@ -89,7 +95,7 @@ test("returning page scopes SDK through its data attribute and all four required
   assert.ok(!JSON.stringify([...page.storage]).includes(savedBuyer.vaultId));
 });
 
-test("editing captures only the approved order and disables the direct-charge button after success", async () => {
+test("returning approval waits for Place order, which captures the approved order once", async () => {
   const page = browser("returning");
   await page.ready();
   assert.equal(await page.callbacks.createOrder(), complete.id);
@@ -98,6 +104,12 @@ test("editing captures only the approved order and disables the direct-charge bu
   assert.equal(page.element("payment-capture-details").hidden, true);
   assert.equal(page.element("place-order").disabled, true);
   await page.callbacks.onApprove({ orderID: complete.id });
+  assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 0);
+  assert.equal(page.requests.filter((request) => request.path === "/api/direct-charge").length, 0);
+  assert.equal(page.element("payment-capture-details").hidden, true);
+  assert.equal(page.element("place-order").disabled, false);
+  assert.match(page.element("status").textContent, /Click "Place order with saved method"/);
+  await Promise.all([page.element("place-order").events.click(), page.element("place-order").events.click()]);
   assert.match(page.element("status").textContent, /Payment completed/);
   assert.equal(page.element("payment-capture-details").hidden, false);
   assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
@@ -140,6 +152,7 @@ test("a pending capture shows its order ID and reveals the transaction ID only a
   await page.ready();
   await page.callbacks.createOrder();
   await page.callbacks.onApprove({ orderID: complete.id });
+  await page.element("place-order").events.click();
   assert.equal(page.element("payment-order-id").textContent, complete.id);
   assert.equal(page.element("payment-capture-details").hidden, true);
   assert.equal(page.element("payment-capture-id").textContent, "—");
@@ -147,6 +160,105 @@ test("a pending capture shows its order ID and reveals the transaction ID only a
   assert.equal(page.element("payment-capture-details").hidden, false);
   assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
 });
+
+test("Place order without editing makes only a direct saved-method payment", async () => {
+  const page = browser("returning");
+  await page.ready();
+  await page.element("place-order").events.click();
+  assert.equal(page.requests.filter((request) => request.path === "/api/orders").length, 0);
+  assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 0);
+  assert.equal(page.requests.filter((request) => request.path === "/api/direct-charge").length, 1);
+  assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+});
+
+test("a further edit creates a fresh order and Place order captures only the latest approval", async () => {
+  const secondId = "ORDER00002";
+  let orders = 0;
+  const page = browser("returning", (path) => {
+    if (path === "/api/orders") return { order: { id: ++orders === 1 ? complete.id : secondId, status: "PAYER_ACTION_REQUIRED" } };
+    if (path === `/api/orders/${secondId}/capture`) return { order: { ...complete, id: secondId } };
+  });
+  await page.ready();
+  await page.callbacks.createOrder();
+  await page.callbacks.onApprove({ orderID: complete.id });
+  assert.equal(await page.callbacks.createOrder(), secondId);
+  assert.equal(page.element("place-order").disabled, true);
+  await page.callbacks.onApprove({ orderID: secondId });
+  const created = page.requests.filter((request) => request.path === "/api/orders");
+  assert.notEqual(created[0].body.requestId, created[1].body.requestId);
+  assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+  await page.element("place-order").events.click();
+  const captured = page.requests.filter((request) => request.path.endsWith("/capture"));
+  assert.deepEqual(captured.map((request) => request.path), [`/api/orders/${secondId}/capture`]);
+  assert.equal(page.requests.some((request) => request.path === "/api/direct-charge"), false);
+});
+
+test("cancelling an unapproved edit leaves Place order using the saved method", async () => {
+  const page = browser("returning");
+  await page.ready();
+  await page.callbacks.createOrder();
+  page.callbacks.onCancel();
+  assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+  await page.element("place-order").events.click();
+  assert.equal(page.requests.filter((request) => request.path === "/api/direct-charge").length, 1);
+  assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+});
+
+test("reload restores an approved order without charging until Place order", async () => {
+  const first = browser("returning");
+  await first.ready();
+  await first.callbacks.createOrder();
+  await first.callbacks.onApprove({ orderID: complete.id });
+  const restored = browser("returning", (path) => {
+    if (path.startsWith("/api/operations/")) return { order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" } };
+    if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "APPROVED" } };
+  }, savedBuyer, true, { storage: first.storage });
+  await restored.ready();
+  assert.equal(restored.element("payment-order-id").textContent, complete.id);
+  assert.equal(restored.element("place-order").disabled, false);
+  assert.equal(restored.requests.some((request) => request.path.endsWith("/capture") || request.path === "/api/direct-charge"), false);
+  await restored.element("place-order").events.click();
+  assert.equal(restored.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
+  assert.equal(restored.requests.some((request) => request.path === "/api/direct-charge"), false);
+});
+
+test("returning redirect approval waits for Place order on the merchant page", async () => {
+  const page = browser("returning", (path) => {
+    if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "APPROVED" } };
+  }, savedBuyer, true, { search: `?paypal=return&token=${complete.id}` });
+  await page.ready();
+  assert.equal(page.element("payment-order-id").textContent, complete.id);
+  assert.equal(page.element("place-order").disabled, false);
+  assert.equal(page.requests.some((request) => request.path.endsWith("/capture") || request.path === "/api/direct-charge"), false);
+  await page.element("place-order").events.click();
+  assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
+});
+
+for (const settled of [false, true]) {
+  test(`lost capture response recovers ${settled ? "a completed payment" : "an uncharged approved order"} without charging during status checks`, async () => {
+    let captures = 0;
+    const page = browser("returning", (path) => {
+      if (path.endsWith("/capture")) {
+        if (++captures === 1) throw new Error("connection lost");
+        return { order: complete };
+      }
+      if (path === `/api/orders/${complete.id}`) return { order: settled ? complete : { id: complete.id, status: "APPROVED" } };
+    });
+    await page.ready();
+    await page.callbacks.createOrder();
+    await page.callbacks.onApprove({ orderID: complete.id });
+    await page.element("place-order").events.click();
+    assert.equal(page.element("place-order").disabled, true);
+    await page.callbacks.onApprove({ orderID: complete.id });
+    await page.element("check-status").events.click();
+    assert.equal(captures, 1);
+    assert.equal(page.requests.some((request) => request.path === "/api/direct-charge"), false);
+    assert.equal(page.element("place-order").disabled, settled);
+    if (!settled) await page.element("place-order").events.click();
+    assert.equal(captures, settled ? 1 : 2);
+    assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+  });
+}
 
 test("empty returning state makes no SDK or payment calls", async () => {
   const page = browser("returning", undefined, null);

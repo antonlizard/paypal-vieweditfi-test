@@ -137,7 +137,7 @@ export class VaultStore {
         return_url: `${origin}/${page}?paypal=return`,
         cancel_url: `${origin}/${page}?paypal=cancel`,
         shipping_preference: "NO_SHIPPING",
-        user_action: "PAY_NOW",
+        user_action: flow === "returning" ? "CONTINUE" : "PAY_NOW",
       };
       let source;
       let sequence;

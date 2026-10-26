@@ -13,7 +13,7 @@ This is a **sandbox-only integration test**. It defaults to a $10.00 USD purchas
 
 Both pages display the shared saved buyer and an expandable activity panel. The returning page shows an empty state until a payment method is available. No simulated funding instrument is displayed.
 
-The returning page displays the Order ID as soon as ViewEditFI creates the order, followed by the Transaction ID (capture ID) once capture completes. These details also appear for payments made directly with the saved method and for recovered payment results.
+The returning page displays the Order ID as soon as ViewEditFI creates the order. Approving a payment-method change returns to the merchant page without capturing payment. The buyer clicks **Place order with saved method** to capture that approved order, after which its Transaction ID (capture ID) is displayed. These details also appear for payments made directly with the saved method and for recovered payment results.
 
 ## Deploy this repository to Cloudflare
 
@@ -83,7 +83,7 @@ Use a sandbox merchant REST app with PayPal vaulting enabled and a separate sand
 
 1. Complete a purchase on **New customer** with the sandbox buyer. Confirm a completed capture and a saved vault ID.
 2. Open **Returning customer**. Confirm the actual PayPal component displays the saved payment method.
-3. Test the edit path: engage the component, approve in PayPal, and confirm the approved order is captured. Per the supplied guide, approval completes that purchase; the app then disables the direct-charge button.
+3. Test the edit path: engage the component and approve in PayPal. Confirm the Order ID is visible and no capture has occurred. Click **Place order with saved method** and confirm that the same order is captured and its Transaction ID is displayed. Duplicate clicks must not create another payment.
 4. Select **Start another returning-customer purchase**. Keep the saved method and press **Place order with saved method**. Confirm it completes without a second `/capture` request.
 5. Reload or use another browser with the same Basic credentials. The saved vault ID should remain the same.
 6. Complete a new-customer purchase with a different buyer. The returning page should now use the replacement vault ID. A returning page left open with the old buyer will reject payment and request a reload.
@@ -131,7 +131,9 @@ buttons,funding-eligibility,messages,saved-payment-methods
 
 `paypal.SavedPaymentMethods({ createOrder, onApprove, onCancel, onError })` renders into the returning page. No `vaultId` is passed to this constructor.
 
-The component's `createOrder` callback invokes the server only when the buyer engages it. That order contains `payment_source.paypal.experience_context.preferred_payment_source.vault_id`, using the same ID as the token's scope. `onApprove` captures that specific order.
+The component's `createOrder` callback invokes the server only when the buyer engages it. That order contains `payment_source.paypal.experience_context.preferred_payment_source.vault_id`, using the same ID as the token's scope. The returning SDK uses `commit=false`, matched by `experience_context.user_action=CONTINUE` in the Orders request.
+
+`onApprove` retains the approved Order ID and enables **Place order with saved method** without submitting a capture. That button captures the existing approved order; it does not create a second direct-charge order. Reloads, PayPal redirects, and status checks restore an approved order without capturing it. A further edit creates a new order, and only the latest approved order can be submitted from this page. The new-customer flow continues to capture immediately after PayPal approval.
 
 If the buyer keeps the saved method, the separate place-order button calls the server with the expected cache revision. The server uses **`payment_source.paypal.vault_id`**. A completed auto-capture response is handled directly; the app never also captures that direct-charge order. An incomplete or payer-action-required result is shown as incomplete, not paid.
 

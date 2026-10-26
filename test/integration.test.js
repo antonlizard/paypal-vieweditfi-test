@@ -156,6 +156,7 @@ test("new customer purchase creates a vault, caches it, and scopes the SDK token
   assert.deepEqual(source.attributes.vault, { store_in_vault: "ON_SUCCESS", usage_type: "MERCHANT", permit_multiple_payment_tokens: false });
   assert.match(source.attributes.customer.merchant_customer_id, /^editfi-/);
   assert.equal(source.experience_context.return_url, "https://test.example/new-customer?paypal=return");
+  assert.equal(source.experience_context.user_action, "PAY_NOW");
   const buyer = (await h.call("/api/state")).body.buyer;
   assert.equal(buyer.vaultId, `vault-${id}`);
   const token = await h.call("/api/client-token", { vaultRevision: buyer.revision, vaultId: "untrusted-vault" });
@@ -174,6 +175,7 @@ test("returning component uses preferred_payment_source and capture without repl
   const created = await h.call("/api/orders", { flow: "returning", requestId: key, vaultRevision: buyer.revision });
   const source = h.calls.filter((call) => call.path === "/v2/checkout/orders").at(-1).body.payment_source.paypal;
   assert.equal(source.experience_context.preferred_payment_source.vault_id, buyer.vaultId);
+  assert.equal(source.experience_context.user_action, "CONTINUE");
   assert.equal(source.vault_id, undefined);
   assert.equal(source.attributes, undefined);
   await h.call(`/api/orders/${created.body.order.id}/capture`, {});

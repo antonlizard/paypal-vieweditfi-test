@@ -1,9 +1,10 @@
 const $ = (id) => document.getElementById(id);
 const flow = document.body.dataset.flow;
-let settings, buyer, mounted = false, busy = false, paid = false, unresolved = false, lastOrderId;
+let settings, buyer, mounted = false, busy = false, paid = false, unresolved = false, lastOrderId, approvedOrderId, submittingPayment = false;
 const activity = [];
 const context = () => flow === "new" ? "new" : `returning:${buyer?.revision}`;
 const storageKey = (kind) => `editfi:${context()}:${kind}`;
+const placeOrderPrompt = 'Payment method approved. Click "Place order with saved method" to complete the purchase.';
 
 function log(event, data) {
   activity.unshift({ time: new Date().toLocaleTimeString(), event, ...(data ? { data } : {}) });
@@ -107,9 +108,31 @@ async function finish(result) {
   controls();
 }
 
+function hasCapture(order) {
+  return order.purchase_units?.some((unit) => unit.payments?.captures?.length);
+}
+
+function awaitPlacement(order) {
+  approvedOrderId = order.id;
+  lastOrderId = order.id;
+  busy = false;
+  unresolved = false;
+  showPaymentDetails(order);
+  status(placeOrderPrompt);
+  log("Order approved; awaiting Place order", { orderID: order.id });
+  controls();
+}
+
 async function createOrder() {
-  if (paid || unresolved) throw new Error("This checkout already submitted a payment. Start a new purchase after checking its result.");
+  if (paid || unresolved || submittingPayment) throw new Error("This checkout already submitted a payment. Start a new purchase after checking its result.");
+  if (flow === "returning" && approvedOrderId) {
+    // A further edit gets a fresh order. The previous approved order remains
+    // uncaptured; it must never be reused for the buyer's new selection.
+    sessionStorage.removeItem(storageKey("component"));
+    approvedOrderId = undefined;
+  }
   busy = true;
+  lastOrderId = undefined;
   showPaymentDetails(null);
   controls();
   status("Creating the PayPal order…");
@@ -131,27 +154,42 @@ async function createOrder() {
 }
 
 async function onApprove(data) {
+  if (flow === "returning") {
+    if (paid || unresolved || submittingPayment) return;
+    awaitPlacement({ id: data.orderID });
+    return;
+  }
+  return captureOrder(data.orderID);
+}
+
+async function captureOrder(orderID) {
   busy = true;
+  submittingPayment = true;
   controls();
   status("Capturing the approved PayPal order…");
-  lastOrderId = data.orderID;
-  showPaymentDetails({ id: data.orderID });
+  lastOrderId = orderID;
+  showPaymentDetails({ id: orderID });
   try {
-    await finish(await api(`/api/orders/${encodeURIComponent(data.orderID)}/capture`, {}));
+    await finish(await api(`/api/orders/${encodeURIComponent(orderID)}/capture`, {}));
   } catch (error) {
     // An interrupted capture might still have settled at PayPal. Block another
     // purchase and offer status recovery instead of creating a second charge.
-    unresolved = error.code !== "BUYER_CHANGED";
+    unresolved = !paid && error.code !== "BUYER_CHANGED";
     showError(error);
     if (error.code === "BUYER_CHANGED") $("checkout-controls").hidden = true;
     throw error;
+  } finally {
+    submittingPayment = false;
   }
 }
 
 function onCancel() {
+  if (paid || unresolved || submittingPayment) return;
   busy = false;
+  approvedOrderId = undefined;
+  lastOrderId = undefined;
   sessionStorage.removeItem(storageKey("component"));
-  status("PayPal checkout was cancelled. The saved buyer has not changed.");
+  status(flow === "returning" ? "Payment method change cancelled. You can place the order with the saved method." : "PayPal checkout was cancelled. The saved buyer has not changed.");
   log("PayPal checkout cancelled");
   controls();
 }
@@ -160,7 +198,7 @@ function loadSDK(clientToken) {
   return new Promise((resolve, reject) => {
     const components = flow === "new" ? "buttons" : "buttons,funding-eligibility,messages,saved-payment-methods";
     const parameters = new URLSearchParams({
-      "client-id": settings.clientId, components, vault: "true", commit: "true",
+      "client-id": settings.clientId, components, vault: "true", commit: flow === "returning" ? "false" : "true",
       intent: "capture", currency: settings.currency,
     });
     const script = document.createElement("script");
@@ -181,10 +219,13 @@ async function recoverAttempt() {
     const previous = await api(`/api/operations/${encodeURIComponent(key)}`);
     if (!previous.order?.id) continue;
     const result = await api(`/api/orders/${encodeURIComponent(previous.order.id)}`);
-    const hasCapture = result.order.purchase_units?.some((unit) => unit.payments?.captures?.length);
-    if (result.order.completed || kind === "direct" || hasCapture) {
+    if (result.order.completed || kind === "direct" || hasCapture(result.order)) {
       await finish(result);
       return true;
+    }
+    if (flow === "returning" && result.order.status === "APPROVED") {
+      awaitPlacement(result.order);
+      return false;
     }
   }
   return false;
@@ -202,9 +243,19 @@ async function start() {
   const query = new URLSearchParams(location.search);
   if (query.get("paypal") === "cancel") onCancel();
   if (query.get("paypal") === "return" && query.get("token")) {
-    await onApprove({ orderID: query.get("token") });
     history.replaceState(null, "", location.pathname);
-    return;
+    if (flow === "new") {
+      await onApprove({ orderID: query.get("token") });
+      return;
+    }
+    // A mobile/redirect approval must also wait for the merchant's Place order
+    // button. Verify and restore the existing order without making a payment.
+    const result = await api(`/api/orders/${encodeURIComponent(query.get("token"))}`);
+    if (result.order.completed || hasCapture(result.order)) {
+      await finish(result);
+      return;
+    }
+    if (result.order.status === "APPROVED") awaitPlacement(result.order);
   }
   if (flow === "returning" && buyer?.state !== "VAULTED") {
     $("empty-state").hidden = false;
@@ -215,7 +266,7 @@ async function start() {
     status(buyer ? "Waiting for a vaulted token from PayPal." : "Create a saved buyer in Flow 01 to continue.");
     return;
   }
-  if (await recoverAttempt()) return;
+  if (!approvedOrderId && await recoverAttempt()) return;
   let token;
   if (flow === "returning") {
     token = await api("/api/client-token", { vaultRevision: buyer.revision });
@@ -236,22 +287,33 @@ async function start() {
   }
   mounted = true;
   controls();
-  status(flow === "new" ? "Ready. Use a sandbox buyer account to pay and save." : "Ready. Review or edit the saved method, or place the order below.");
+  status(approvedOrderId ? placeOrderPrompt : flow === "new" ? "Ready. Use a sandbox buyer account to pay and save." : "Ready. Review or edit the saved method, or place the order below.");
   log(flow === "new" ? "PayPal Buttons rendered" : "SavedPaymentMethods rendered");
 }
 
 $("place-order")?.addEventListener("click", async () => {
-  if (busy || paid || unresolved || !mounted) return;
+  if (busy || paid || unresolved || submittingPayment || !mounted) return;
+  if (approvedOrderId) {
+    // Approval chooses the instrument; only this explicit merchant-page action
+    // captures that exact order. Never create a second direct-charge order.
+    await captureOrder(approvedOrderId).catch(() => {});
+    return;
+  }
   busy = true;
+  submittingPayment = true;
+  lastOrderId = undefined;
+  showPaymentDetails(null);
   controls();
   status("Charging the saved payment method…");
   try {
     // Create Order with a vault_id can auto-capture. Never also call /capture.
     await finish(await api("/api/direct-charge", { requestId: requestId("direct"), vaultRevision: buyer.revision }));
   } catch (error) {
-    unresolved = !["BUYER_CHANGED", "NO_VAULTED_BUYER"].includes(error.code);
+    unresolved = !paid && !["BUYER_CHANGED", "NO_VAULTED_BUYER"].includes(error.code);
     showError(error);
     if (!unresolved) $("checkout-controls").hidden = true;
+  } finally {
+    submittingPayment = false;
   }
 });
 
@@ -261,7 +323,12 @@ $("check-status").addEventListener("click", async () => {
   controls();
   try {
     if (lastOrderId) {
-      await finish(await api(`/api/orders/${encodeURIComponent(lastOrderId)}`));
+      const result = await api(`/api/orders/${encodeURIComponent(lastOrderId)}`);
+      if (approvedOrderId === lastOrderId && result.order.status === "APPROVED" && !hasCapture(result.order)) {
+        awaitPlacement(result.order);
+      } else {
+        await finish(result);
+      }
     } else {
       // Recover a direct-charge response lost before the order ID arrived.
       // Reuse the exact existing key; never create a fresh payment attempt.
