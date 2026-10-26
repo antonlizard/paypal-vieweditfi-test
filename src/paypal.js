@@ -36,7 +36,10 @@ export class PayPal {
   constructor(env, transport = fetch) {
     this.env = env;
     this.settings = config(env);
-    this.transport = transport;
+    // workerd requires native fetch's receiver to be the Worker global scope.
+    // Calling an unbound fetch as this.transport() would use this PayPal
+    // instance as its receiver and throw before any HTTP request is sent.
+    this.transport = transport.bind(globalThis);
     this.accessToken = null;
   }
 
@@ -47,8 +50,17 @@ export class PayPal {
         ...init,
         signal: AbortSignal.timeout(20000),
       });
-    } catch {
-      throw new AppError(502, "PAYPAL_UNREACHABLE", "PayPal did not respond. Retry the same operation; its payment idempotency key is preserved.");
+    } catch (error) {
+      const invalidReceiver = /Illegal invocation|incorrect.*this.*reference/i.test(error?.message || "");
+      const reason = invalidReceiver ? "INVALID_FETCH_CONTEXT" :
+        error?.name === "TimeoutError" ? "TIMEOUT" :
+        error?.name === "AbortError" ? "ABORTED" : "NETWORK_ERROR";
+      // Return only a known category and API path. Raw exception messages can
+      // contain request details and must not expose credentials or tokens.
+      if (invalidReceiver) {
+        throw new AppError(500, "WORKER_FETCH_ERROR", "The Worker could not invoke its outbound HTTP client.", { endpoint: path, reason });
+      }
+      throw new AppError(502, "PAYPAL_UNREACHABLE", "The Worker could not complete its request to PayPal. Retry the same operation; its payment idempotency key is preserved.", { endpoint: path, reason });
     }
     const body = await response.json().catch(() => ({}));
     if (!response.ok) {
