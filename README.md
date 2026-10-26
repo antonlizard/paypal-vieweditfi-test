@@ -15,6 +15,10 @@ Both pages display the shared saved buyer and an expandable activity panel. The 
 
 The returning page displays the Order ID as soon as ViewEditFI creates the order. Approving a payment-method change returns to the merchant page without capturing payment. The buyer clicks **Place order with saved method** to capture that approved order, after which its Transaction ID (capture ID) is displayed. These details also appear for payments made directly with the saved method and for recovered payment results.
 
+Both pages include expandable **Create order** and **Capture** panels showing the backend's PayPal REST method, URL, safe headers, JSON request body, response HTTP status, and full response body. Errors are shown too. Capture details appear only after a capture is requested; direct saved-method payments identify that no separate capture call was sent and show the payment result in Create order.
+
+Traces are retained with the checkout for retries and reloads. Orders created before this tracing feature may not have their original responses available; start a new purchase to record both steps. OAuth exchanges and Authorization headers are excluded, and credentials, tokens, and sensitive fields are redacted before traces are stored or returned.
+
 ## Deploy this repository to Cloudflare
 
 Source repository: [antonlizard/paypal-vieweditfi-test](https://github.com/antonlizard/paypal-vieweditfi-test).

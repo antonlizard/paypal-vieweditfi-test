@@ -66,7 +66,7 @@ function harness() {
         requestIds.set(requestId, order);
       } else assert.deepEqual(body, order.body, "Idempotent retries must use identical payloads");
       if (mock.loseCreateResponse) { mock.loseCreateResponse = false; throw new Error("response lost after processing"); }
-      return Response.json(order.result);
+      return Response.json(order.result, { status: 201, headers: { "paypal-debug-id": "create-debug-id" } });
     }
     const match = path.match(/^\/v2\/checkout\/orders\/(ORDER\d+)(\/capture)?$/);
     assert.ok(match, `Unexpected PayPal request ${path}`);
@@ -76,7 +76,7 @@ function harness() {
       if (mock.failCapture) return Response.json({ name: "UNPROCESSABLE_ENTITY", message: "Payment declined", debug_id: "safe-debug-id" }, { status: 422 });
       order.result = completed(order, order.id);
     }
-    return Response.json(order.result);
+    return Response.json(order.result, { status: match[2] ? 201 : 200, headers: { "paypal-debug-id": "capture-debug-id" } });
   }
   function restart() {
     store = new VaultStore({ storage }, env);
@@ -182,6 +182,69 @@ test("returning component uses preferred_payment_source and capture without repl
   assert.deepEqual((await h.call("/api/state")).body.buyer, buyer);
 });
 
+test("Orders traces preserve the actual REST requests and full responses across replay and reload", async () => {
+  const h = harness();
+  await h.newCheckout();
+  const buyer = (await h.call("/api/state")).body.buyer;
+  const body = { flow: "returning", requestId: crypto.randomUUID(), vaultRevision: buyer.revision };
+  const created = await h.call("/api/orders", body);
+  const id = created.body.order.id;
+  const actual = h.calls.filter((call) => call.path === "/v2/checkout/orders").at(-1);
+  const create = created.body.traces.create;
+  assert.equal(create.request.method, "POST");
+  assert.equal(create.request.url, "https://api-m.sandbox.paypal.com/v2/checkout/orders");
+  assert.deepEqual(create.request.body, actual.body);
+  assert.equal(create.request.headers["PayPal-Request-Id"], actual.headers["PayPal-Request-Id"]);
+  assert.equal(create.request.headers.Authorization, undefined);
+  assert.equal(create.response.status, 201);
+  assert.equal(create.response.headers["paypal-debug-id"], "create-debug-id");
+  assert.deepEqual(create.response.body, h.orders.get(id).result);
+  assert.equal(created.body.traces.capture, undefined);
+  const captured = await h.call(`/api/orders/${id}/capture`, {});
+  const capture = captured.body.traces.capture;
+  assert.equal(capture.request.url, `https://api-m.sandbox.paypal.com/v2/checkout/orders/${id}/capture`);
+  assert.equal(capture.request.headers["PayPal-Request-Id"], `capture-${id}`);
+  assert.deepEqual(capture.request.body, {});
+  assert.equal(capture.response.status, 201);
+  assert.deepEqual(capture.response.body, JSON.parse(JSON.stringify(h.orders.get(id).result)));
+  assert.deepEqual(captured.body.traces.create, create);
+  h.restart();
+  const recovered = await h.call(`/api/operations/${body.requestId}`);
+  assert.deepEqual(recovered.body.traces, captured.body.traces);
+  await h.call(`/api/orders/${id}`);
+  const before = h.calls.length;
+  const replay = await h.call(`/api/orders/${id}/capture`, {});
+  assert.equal(h.calls.length, before);
+  assert.deepEqual(replay.body.traces, captured.body.traces);
+  const serialized = JSON.stringify(captured.body.traces);
+  for (const secret of [h.env.PAYPAL_CLIENT_SECRET, h.env.BASIC_AUTH_PASSWORD, "server-access-token"]) assert.equal(serialized.includes(secret), false);
+  const token = await h.call("/api/client-token", { vaultRevision: buyer.revision });
+  assert.equal(token.body.traces, undefined);
+});
+
+test("failed captures return and retain their HTTP trace without changing payment state", async () => {
+  const h = harness();
+  await h.newCheckout();
+  const buyer = (await h.call("/api/state")).body.buyer;
+  const key = crypto.randomUUID();
+  const created = await h.call("/api/orders", { flow: "returning", requestId: key, vaultRevision: buyer.revision });
+  const id = created.body.order.id;
+  h.mock.failCapture = true;
+  const failed = await h.call(`/api/orders/${id}/capture`, {});
+  assert.equal(failed.status, 502);
+  const traces = failed.body.details.traces;
+  assert.equal(traces.capture.attempted, true);
+  assert.equal(traces.capture.response.status, 422);
+  assert.equal(traces.capture.response.body.name, "UNPROCESSABLE_ENTITY");
+  assert.deepEqual(traces.create, created.body.traces.create);
+  assert.deepEqual((await h.call(`/api/operations/${key}`)).body.traces, traces);
+  assert.deepEqual((await h.call("/api/state")).body.buyer, buyer);
+  h.mock.failCapture = false;
+  const retried = await h.call(`/api/orders/${id}/capture`, {});
+  assert.equal(retried.body.traces.capture.response.status, 201);
+  assert.equal(retried.body.traces.capture.error, undefined);
+});
+
 test("direct saved-method purchase auto-captures once, including duplicate clicks", async () => {
   const h = harness();
   await h.newCheckout();
@@ -192,6 +255,9 @@ test("direct saved-method purchase auto-captures once, including duplicate click
   assert.equal(first.body.order.completed, true);
   assert.equal(first.body.order.id, retry.body.order.id);
   assert.equal(h.mock.charges, 1);
+  assert.equal(first.body.traces.create.response.status, 201);
+  assert.equal(first.body.traces.create.request.body.payment_source.paypal.vault_id, buyer.vaultId);
+  assert.equal(first.body.traces.capture, undefined);
   assert.equal(h.calls.filter((call) => call.path.endsWith("/capture")).length, before);
   const payload = h.calls.filter((call) => call.path === "/v2/checkout/orders").at(-1).body;
   assert.equal(payload.payment_source.paypal.vault_id, buyer.vaultId);

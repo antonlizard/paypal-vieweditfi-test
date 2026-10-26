@@ -86,7 +86,7 @@ export class VaultStore {
     const operationMatch = path.match(/^\/api\/operations\/([0-9a-f-]+)$/i);
     if (method === "GET" && operationMatch && UUID.test(operationMatch[1])) {
       const operation = await this.storage.get(`operation:${operationMatch[1]}`);
-      return json({ order: operation?.result || null });
+      return json({ order: operation?.result || null, traces: operation?.traces || {} });
     }
     const orderMatch = path.match(/^\/api\/orders\/([A-Z0-9]+)(\/capture)?$/i);
     if (orderMatch && ORDER_ID.test(orderMatch[1])) {
@@ -122,7 +122,7 @@ export class VaultStore {
     }
     // Return an existing result before checking the active buyer, so retries
     // after a completed request can still recover the original outcome.
-    if (operation?.result) return json({ order: operation.result, replayed: true });
+    if (operation?.result) return json({ order: operation.result, traces: operation.traces || {}, replayed: true });
     if (operation && Date.now() - Date.parse(operation.createdAt) > 5 * 60 * 60 * 1000) {
       // PayPal's default idempotency retention is finite. An unresolved create
       // must not be blindly submitted again after that protection might expire.
@@ -181,32 +181,51 @@ export class VaultStore {
       // response is lost or the object restarts, retry the same PayPal request.
       await this.storage.put(key, operation);
     }
-    const order = await this.paypal.api("/v2/checkout/orders", {
+    const order = await this.paymentRequest(operation, "create", "/v2/checkout/orders", {
       method: "POST", body: operation.payload, requestId: `create-${operation.requestId}`,
     });
-    if (!ORDER_ID.test(order.id || "")) throw new AppError(502, "INVALID_ORDER_RESPONSE", "PayPal did not return an order ID.");
+    if (!ORDER_ID.test(order.id || "")) throw new AppError(502, "INVALID_ORDER_RESPONSE", "PayPal did not return an order ID.", { traces: operation.traces });
     operation.orderId = order.id;
     operation.result = summary(order);
     await this.finish(operation, order);
-    return json({ order: operation.result });
+    return json({ order: operation.result, traces: operation.traces });
+  }
+
+  async paymentRequest(operation, kind, path, init) {
+    const trace = {};
+    operation.traces ||= {};
+    try {
+      const result = await this.paypal.api(path, { ...init, trace });
+      operation.traces[kind] = trace;
+      await this.storage.put(`operation:${operation.requestId}`, operation);
+      return result;
+    } catch (error) {
+      operation.traces[kind] = trace;
+      await this.storage.put(`operation:${operation.requestId}`, operation);
+      if (error instanceof AppError) {
+        error.message = this.paypal.safeTrace(error.message);
+        error.details = this.paypal.safeTrace({ ...error.details, traces: operation.traces });
+      }
+      throw error;
+    }
   }
 
   async order(orderId, capture) {
     const operationKey = await this.storage.get(`order:${orderId}`);
     const operation = operationKey ? await this.storage.get(operationKey) : null;
     if (!operation) throw new AppError(404, "UNKNOWN_ORDER", "This order was not created by this test application.");
-    if (capture && operation.result?.completed) return json({ order: operation.result, replayed: true });
+    if (capture && operation.result?.completed) return json({ order: operation.result, traces: operation.traces || {}, replayed: true });
     if (capture && operation.flow !== "new") await this.current(operation.vaultRevision);
     if (capture && operation.flow === "direct") {
       throw new AppError(409, "DIRECT_ORDER", "Direct charges are processed by create order. Check their status instead of capturing again.");
     }
-    const order = await this.paypal.api(`/v2/checkout/orders/${orderId}${capture ? "/capture" : ""}`, {
-      method: capture ? "POST" : "GET",
-      ...(capture ? { body: {}, requestId: `capture-${orderId}` } : {}),
-    });
+    const path = `/v2/checkout/orders/${orderId}`;
+    const order = capture ? await this.paymentRequest(operation, "capture", `${path}/capture`, {
+      method: "POST", body: {}, requestId: `capture-${orderId}`,
+    }) : await this.paypal.api(path);
     operation.result = summary(order);
     await this.finish(operation, order);
-    return json({ order: operation.result, buyer: publicBuyer(await this.storage.get("current")) });
+    return json({ order: operation.result, traces: operation.traces || {}, buyer: publicBuyer(await this.storage.get("current")) });
   }
 
   async finish(operation, order) {

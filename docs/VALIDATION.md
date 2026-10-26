@@ -3,11 +3,12 @@
 Validated locally on 2026-10-27 with Node.js 24.22.1.
 
 - JavaScript syntax checks passed for the Worker, PayPal client, Durable Object, and browser code.
-- 40 automated tests passed using Node's built-in test runner, mocked PayPal HTTP responses, simulated persistent Durable Object storage, and a simulated browser DOM/SDK.
+- 46 automated tests passed using Node's built-in test runner, mocked PayPal HTTP responses, simulated persistent Durable Object storage, and a simulated browser DOM/SDK.
 - Covered authentication on pages/assets/APIs, cross-origin request rejection, both checkout paths, token scoping, cache persistence and replacement, stale pages, out-of-order callbacks, idempotency/restart recovery, pending captures/vaulting, and verified asynchronous vault events.
 - A receiver-sensitive fetch regression test reproduces the original adapter's failure and verifies OAuth, Orders, and scoped-token requests use the Worker global receiver. Error tests distinguish network, timeout, abort, and invocation failures without returning raw exceptions or credentials.
 - Frontend checks verify that the returning checkout shows the Order ID on creation and the completed capture's Transaction ID after payment, including direct-payment recovery and a pending capture transitioning to completion.
 - Returning-customer approval makes no capture call. Tests verify capture only after Place order, direct payment when there was no edit, repeated edits, cancellation, duplicate clicks, reload/redirect recovery, and lost capture responses. The new-customer flow still captures after approval.
+- Trace tests compare displayed requests/responses with the actual PayPal HTTP calls, verify persistence and replay, cover failed captures and non-JSON errors, and ensure OAuth data, authentication headers, secrets, and tokens are not exposed. Frontend checks cover separate create/capture panels, errors, and direct payment without a fabricated capture call.
 
 Not verified in this session:
 

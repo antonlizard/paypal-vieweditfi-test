@@ -32,6 +32,25 @@ function basic(clientId, secret) {
   return btoa(`${clientId}:${secret}`);
 }
 
+const privateFields = new Set([
+  "authorization", "proxyauthorization", "cookie", "setcookie", "password", "basicauthpassword",
+  "secret", "clientsecret", "paypalclientsecret", "accesstoken", "refreshtoken", "idtoken",
+  "clienttoken", "sdkclienttoken", "token", "apikey", "cvv", "cvc", "securitycode", "number", "cardnumber",
+]);
+
+function redact(value, secrets) {
+  if (Array.isArray(value)) return value.map((item) => redact(item, secrets));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+      key, privateFields.has(key.replace(/[^a-z0-9]/gi, "").toLowerCase()) ? "[REDACTED]" : redact(item, secrets),
+    ]));
+  }
+  if (typeof value === "string") {
+    for (const secret of secrets) if (secret) value = value.replaceAll(secret, "[REDACTED]");
+  }
+  return value;
+}
+
 export class PayPal {
   constructor(env, transport = fetch) {
     this.env = env;
@@ -43,9 +62,17 @@ export class PayPal {
     this.accessToken = null;
   }
 
-  async request(path, init) {
+  safeTrace(value) {
+    return redact(value, [
+      basic(this.settings.clientId, this.env.PAYPAL_CLIENT_SECRET),
+      this.env.PAYPAL_CLIENT_SECRET, this.env.BASIC_AUTH_PASSWORD, this.accessToken?.value,
+    ]);
+  }
+
+  async request(path, init, trace) {
     let response;
     try {
+      if (trace) trace.attempted = true;
       response = await this.transport(this.settings.apiBase + path, {
         ...init,
         signal: AbortSignal.timeout(20000),
@@ -62,7 +89,20 @@ export class PayPal {
       }
       throw new AppError(502, "PAYPAL_UNREACHABLE", "The Worker could not complete its request to PayPal. Retry the same operation; its payment idempotency key is preserved.", { endpoint: path, reason });
     }
-    const body = await response.json().catch(() => ({}));
+    const text = await response.text();
+    let body = {};
+    let responseBody = text;
+    try { body = responseBody = JSON.parse(text); } catch {}
+    if (trace) {
+      trace.response = this.safeTrace({
+        status: response.status,
+        headers: Object.fromEntries(["content-type", "paypal-debug-id"].flatMap((name) => {
+          const value = response.headers.get(name);
+          return value ? [[name, value]] : [];
+        })),
+        body: responseBody,
+      });
+    }
     if (!response.ok) {
       // Do not forward raw OAuth bodies, headers, or credentials to the browser.
       throw new AppError(502, "PAYPAL_API_ERROR", body.message || body.error_description || "PayPal rejected the request.", {
@@ -109,17 +149,35 @@ export class PayPal {
     return { clientToken: result.access_token, expiresIn: result.expires_in };
   }
 
-  async api(path, { method = "GET", body, requestId } = {}) {
-    return this.request(path, {
-      method,
-      headers: {
-        Authorization: `Bearer ${await this.token()}`,
-        "Content-Type": "application/json",
-        Prefer: "return=representation",
-        ...(requestId ? { "PayPal-Request-Id": requestId } : {}),
-      },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    });
+  async api(path, { method = "GET", body, requestId, trace } = {}) {
+    const headers = {
+      "Content-Type": "application/json",
+      Prefer: "return=representation",
+      ...(requestId ? { "PayPal-Request-Id": requestId } : {}),
+    };
+    if (trace) {
+      // Trace only the explicit Orders calls requested by the caller. OAuth
+      // requests/responses and Authorization headers never enter the trace.
+      Object.assign(trace, {
+        request: this.safeTrace({ method, url: this.settings.apiBase + path, headers, body: body ?? null }),
+        response: null,
+        attempted: false,
+      });
+    }
+    try {
+      const token = await this.token();
+      return await this.request(path, {
+        method,
+        headers: { ...headers, Authorization: `Bearer ${token}` },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      }, trace);
+    } catch (error) {
+      if (trace) trace.error = this.safeTrace({
+        code: error instanceof AppError ? error.code : "REQUEST_FAILED",
+        message: error instanceof AppError ? error.message : "The request could not be completed.",
+      });
+      throw error;
+    }
   }
 }
 

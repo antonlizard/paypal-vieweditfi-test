@@ -16,6 +16,31 @@ function status(message, type = "") {
   $("status").className = `status ${type}`;
 }
 
+function resetApiTraces() {
+  for (const kind of ["create", "capture"]) {
+    $(`${kind}-trace`).open = false;
+    $(`${kind}-trace-status`).textContent = "Not requested";
+    $(`${kind}-request`).textContent = "No request recorded yet.";
+    $(`${kind}-response`).textContent = "No response recorded yet.";
+  }
+}
+
+function showApiTraces(traces) {
+  for (const kind of ["create", "capture"]) {
+    const trace = traces[kind];
+    if (!trace) continue;
+    $(`${kind}-trace`).open = true;
+    $(`${kind}-trace-status`).textContent = trace.response ? `HTTP ${trace.response.status}` : trace.attempted ? "No response" : "Not sent";
+    $(`${kind}-request`).textContent = JSON.stringify(trace.request, null, 2);
+    $(`${kind}-response`).textContent = JSON.stringify(trace.response || { error: trace.error || "No response received." }, null, 2);
+  }
+  if (traces.create?.request?.body?.payment_source?.paypal?.vault_id && !traces.capture) {
+    $("capture-trace-status").textContent = "No separate call";
+    $("capture-request").textContent = "Direct saved-method payments use Create order. No separate capture request was sent.";
+    $("capture-response").textContent = "See the Create order response for this payment's result.";
+  }
+}
+
 function controls() {
   const locked = busy || paid || unresolved;
   const container = $("checkout-controls");
@@ -48,6 +73,8 @@ async function api(path, body) {
     throw new Error("The request did not finish. Retry this checkout; its payment idempotency key is preserved.");
   }
   const result = await response.json().catch(() => ({}));
+  if (result.traces) showApiTraces(result.traces);
+  if (result.details?.traces) showApiTraces(result.details.traces);
   if (!response.ok) {
     const error = new Error(result.message || `Request failed (${response.status}).`);
     Object.assign(error, { code: result.error, details: result.details });
@@ -134,6 +161,7 @@ async function createOrder() {
   busy = true;
   lastOrderId = undefined;
   showPaymentDetails(null);
+  resetApiTraces();
   controls();
   status("Creating the PayPal order…");
   try {
@@ -303,6 +331,7 @@ $("place-order")?.addEventListener("click", async () => {
   submittingPayment = true;
   lastOrderId = undefined;
   showPaymentDetails(null);
+  resetApiTraces();
   controls();
   status("Charging the saved payment method…");
   try {

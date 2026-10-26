@@ -6,6 +6,14 @@ import vm from "node:vm";
 const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
 const savedBuyer = { revision: "revision-1", vaultId: "server-vault-1", state: "VAULTED", savedAt: new Date().toISOString() };
 const complete = { id: "ORDER00001", status: "COMPLETED", completed: true, purchase_units: [{ payments: { captures: [{ id: "CAPTURE00001", status: "COMPLETED" }] } }] };
+const createTrace = {
+  request: { method: "POST", url: "https://api-m.sandbox.paypal.com/v2/checkout/orders", headers: { "PayPal-Request-Id": "create-test" }, body: { intent: "CAPTURE", purchase_units: [{ amount: { currency_code: "EUR", value: "10.00" } }] } },
+  response: { status: 201, headers: {}, body: { id: complete.id, status: "PAYER_ACTION_REQUIRED" } }, attempted: true,
+};
+const captureTrace = {
+  request: { method: "POST", url: `https://api-m.sandbox.paypal.com/v2/checkout/orders/${complete.id}/capture`, headers: {}, body: {} },
+  response: { status: 201, headers: {}, body: complete }, attempted: true,
+};
 
 // This exercises browser event logic and SDK configuration with a fake DOM and
 // PayPal SDK. It is a contract test, not visual/browser or real-PayPal testing.
@@ -42,12 +50,18 @@ function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, has
       const body = init.body ? JSON.parse(init.body) : undefined;
       requests.push({ path, body, init });
       const custom = await backend(path, body);
+      if (custom instanceof Response) return custom;
       if (custom !== undefined) return Response.json(custom);
       if (path === "/api/config") return Response.json({ clientId: "public-client-id", sdkBase: "https://www.sandbox.paypal.com", environment: "sandbox", currency: "USD", amount: "10.00" });
       if (path === "/api/state") return Response.json({ buyer: initialBuyer });
       if (path === "/api/client-token") return Response.json({ clientToken: "scoped-test-token", expiresIn: 32400 });
-      if (path === "/api/orders") return Response.json({ order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" } });
-      if (path.endsWith("/capture") || path === "/api/direct-charge") return Response.json({ order: complete });
+      if (path === "/api/orders") return Response.json({ order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" }, traces: { create: createTrace } });
+      if (path.endsWith("/capture")) return Response.json({ order: complete, traces: { create: createTrace, capture: captureTrace } });
+      if (path === "/api/direct-charge") return Response.json({ order: complete, traces: { create: {
+        ...createTrace,
+        request: { ...createTrace.request, body: { intent: "CAPTURE", payment_source: { paypal: { vault_id: savedBuyer.vaultId } } } },
+        response: { ...createTrace.response, body: complete },
+      } } });
       throw new Error(`Unexpected API call: ${path}`);
     },
   });
@@ -103,6 +117,11 @@ test("returning approval waits for Place order, which captures the approved orde
   assert.equal(page.element("payment-order-id").textContent, complete.id);
   assert.equal(page.element("payment-capture-details").hidden, true);
   assert.equal(page.element("place-order").disabled, true);
+  assert.equal(page.element("create-trace").open, true);
+  assert.equal(page.element("create-trace-status").textContent, "HTTP 201");
+  assert.deepEqual(JSON.parse(page.element("create-request").textContent), createTrace.request);
+  assert.deepEqual(JSON.parse(page.element("create-response").textContent).body, createTrace.response.body);
+  assert.equal(page.element("capture-trace-status").textContent, "Not requested");
   await page.callbacks.onApprove({ orderID: complete.id });
   assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 0);
   assert.equal(page.requests.filter((request) => request.path === "/api/direct-charge").length, 0);
@@ -115,6 +134,9 @@ test("returning approval waits for Place order, which captures the approved orde
   assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
   assert.equal(page.element("payment-details").hidden, false);
   await page.element("place-order").events.click();
+  assert.equal(page.element("capture-trace").open, true);
+  assert.deepEqual(JSON.parse(page.element("capture-request").textContent).body, {});
+  assert.equal(JSON.parse(page.element("capture-response").textContent).body.purchase_units[0].payments.captures[0].id, "CAPTURE00001");
   assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
   assert.equal(page.requests.filter((request) => request.path === "/api/direct-charge").length, 0);
 });
@@ -169,6 +191,22 @@ test("Place order without editing makes only a direct saved-method payment", asy
   assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 0);
   assert.equal(page.requests.filter((request) => request.path === "/api/direct-charge").length, 1);
   assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+  assert.equal(page.element("capture-trace-status").textContent, "No separate call");
+  assert.match(page.element("capture-request").textContent, /No separate capture request was sent/);
+  assert.equal(JSON.parse(page.element("create-response").textContent).body.id, complete.id);
+});
+
+test("a failed create displays the REST request and error response without attempting capture", async () => {
+  const failedTrace = { ...createTrace, response: { status: 422, headers: {}, body: { name: "UNPROCESSABLE_ENTITY", message: "Order rejected" } } };
+  const page = browser("returning", (path) => {
+    if (path === "/api/orders") return Response.json({ error: "PAYPAL_API_ERROR", message: "Order rejected", details: { traces: { create: failedTrace } } }, { status: 502 });
+  });
+  await page.ready();
+  await assert.rejects(page.callbacks.createOrder(), /Order rejected/);
+  assert.equal(page.element("create-trace-status").textContent, "HTTP 422");
+  assert.equal(JSON.parse(page.element("create-request").textContent).body.intent, "CAPTURE");
+  assert.equal(JSON.parse(page.element("create-response").textContent).body.name, "UNPROCESSABLE_ENTITY");
+  assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
 });
 
 test("a further edit creates a fresh order and Place order captures only the latest approval", async () => {

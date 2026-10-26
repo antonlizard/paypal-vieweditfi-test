@@ -59,3 +59,49 @@ for (const scenario of [
     assert.equal(serialized.includes("Authorization="), false);
   });
 }
+
+test("payment traces retain REST bodies while redacting credentials and tokens recursively", async () => {
+  const trace = {};
+  const settings = { ...env, BASIC_AUTH_PASSWORD: "private-site-password" };
+  const raw = {
+    id: "ORDER00001", status: "PAYER_ACTION_REQUIRED",
+    diagnostic: `Echo ${settings.PAYPAL_CLIENT_SECRET} and server-access-token and private-site-password`,
+    nested: [{ authorization: "Bearer secret-value", client_secret: "arbitrary-secret", clientToken: "private-sdk-token", access_token: "private-token", password: "another-password" }],
+    payment_source: { paypal: { vault_id: "visible-vault-id" } },
+  };
+  const paypal = new PayPal(settings, async (url) => url.endsWith("/v1/oauth2/token") ?
+    Response.json({ access_token: "server-access-token", expires_in: 300 }) :
+    Response.json(raw, { status: 201, headers: { "paypal-debug-id": "safe-debug", "set-cookie": "private-cookie" } }));
+  const result = await paypal.api("/v2/checkout/orders", {
+    method: "POST", body: { intent: "CAPTURE", client_secret: "request-secret" }, requestId: "test-request", trace,
+  });
+  assert.deepEqual(result, raw); // Business responses are not mutated.
+  assert.equal(trace.response.status, 201);
+  assert.equal(trace.response.body.id, raw.id);
+  assert.equal(trace.response.body.payment_source.paypal.vault_id, "visible-vault-id");
+  assert.equal(trace.request.body.client_secret, "[REDACTED]");
+  assert.equal(trace.response.headers["paypal-debug-id"], "safe-debug");
+  const serialized = JSON.stringify(trace);
+  for (const secret of [settings.PAYPAL_CLIENT_SECRET, settings.BASIC_AUTH_PASSWORD, "server-access-token", "arbitrary-secret", "private-sdk-token", "private-token", "another-password", "request-secret", "private-cookie"]) {
+    assert.equal(serialized.includes(secret), false, secret);
+  }
+});
+
+test("failed OAuth is not exposed as an Orders response or an attempted Orders call", async () => {
+  const trace = {};
+  const paypal = new PayPal(env, async () => Response.json({ error: "invalid_client", error_description: `Rejected ${env.PAYPAL_CLIENT_SECRET}` }, { status: 401 }));
+  await assert.rejects(paypal.api("/v2/checkout/orders", { method: "POST", body: {}, trace }));
+  assert.equal(trace.attempted, false);
+  assert.equal(trace.response, null);
+  assert.equal(trace.request.url, "https://api-m.sandbox.paypal.com/v2/checkout/orders");
+  assert.equal(JSON.stringify(trace).includes(env.PAYPAL_CLIENT_SECRET), false);
+});
+
+test("a non-JSON PayPal error response remains available as escaped display data", async () => {
+  const trace = {};
+  const paypal = new PayPal(env, async (url) => url.endsWith("/v1/oauth2/token") ?
+    Response.json({ access_token: "rest-token", expires_in: 300 }) : new Response("<html>Gateway unavailable</html>", { status: 503 }));
+  await assert.rejects(paypal.api("/v2/checkout/orders", { method: "POST", body: {}, trace }));
+  assert.equal(trace.response.status, 503);
+  assert.equal(trace.response.body, "<html>Gateway unavailable</html>");
+});

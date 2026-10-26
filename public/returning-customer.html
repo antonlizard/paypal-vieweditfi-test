@@ -36,6 +36,12 @@
         </section>
         <aside class="card vault-card" aria-labelledby="vault-title"><div class="section-label"><span>SHARED BETWEEN BOTH PAGES</span><span class="mini-icon" aria-hidden="true">◇</span></div><h2 id="vault-title">Saved buyer</h2><span id="vault-state" class="state-chip">Checking</span><p id="vault-message" class="supporting">Reading the saved payment method.</p><dl class="vault-details"><dt>Vault ID</dt><dd id="vault-id">—</dd><dt>PayPal customer ID</dt><dd id="customer-id">—</dd><dt>Buyer</dt><dd id="buyer-email">—</dd><dt>Saved at</dt><dd id="saved-at">—</dd></dl><button id="refresh-vault" class="text-button">Refresh saved buyer</button><div class="aside-note">The saved vault ID is reused for every returning-customer purchase until a new buyer replaces it.</div></aside>
       </div>
+      <section class="card api-traces" aria-labelledby="api-traces-title">
+        <h2 id="api-traces-title">PayPal API requests and responses</h2>
+        <p class="supporting">Backend REST requests and full PayPal responses for this checkout. Authentication headers, credentials, and tokens are omitted or redacted.</p>
+        <details id="create-trace"><summary><span>Create order</span><span id="create-trace-status" class="muted small">Not requested</span></summary><div class="trace-columns"><div><h3>Request</h3><pre id="create-request">No request recorded yet.</pre></div><div><h3>Response</h3><pre id="create-response">No response recorded yet.</pre></div></div></details>
+        <details id="capture-trace"><summary><span>Capture</span><span id="capture-trace-status" class="muted small">Not requested</span></summary><div class="trace-columns"><div><h3>Request</h3><pre id="capture-request">No request recorded yet.</pre></div><div><h3>Response</h3><pre id="capture-response">No response recorded yet.</pre></div></div></details>
+      </section>
       <details class="card diagnostics"><summary><span>Integration activity</span><span class="muted small">SavedPaymentMethods · JS SDK v5</span></summary><p class="supporting">API results and component events for this checkout. Credentials and SDK tokens are omitted.</p><pre id="activity" aria-live="polite">Waiting for configuration…</pre></details>
     </main>
     <footer><span>PayPal ViewEditFI integration test</span><span>Sandbox transactions only</span></footer>
