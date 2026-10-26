@@ -23,6 +23,13 @@
           <div id="empty-state" class="empty-state" hidden><span class="empty-icon" aria-hidden="true">◇</span><h3>No saved buyer yet</h3><p>Complete the new-customer flow to create a saved payment method.</p><a class="button primary" href="/new-customer">Start a new-customer checkout →</a></div>
           <div id="checkout-controls" hidden><p class="payment-label">Your saved payment method</p><div id="saved-payment-methods-container" class="sdk-container saved-method"></div><p class="component-note">Editing opens PayPal and completes the purchase after approval.</p><button id="place-order" class="button primary" disabled>Place order with saved method</button><p class="component-note">Keep the current method to complete without opening PayPal.</p></div>
           <div id="status" class="status" role="status" aria-live="polite">Loading saved buyer…</div>
+          <section id="payment-details" class="payment-details" aria-labelledby="payment-details-title" aria-live="polite" hidden>
+            <h3 id="payment-details-title">Payment details</h3>
+            <dl class="vault-details">
+              <dt>Order ID</dt><dd id="payment-order-id">—</dd>
+              <div id="payment-capture-details" hidden><dt id="payment-capture-label">Transaction ID (capture ID)</dt><dd id="payment-capture-id">—</dd></div>
+            </dl>
+          </section>
           <button id="check-status" class="button secondary" hidden>Check payment status</button>
           <div id="success-actions" hidden><button id="another-checkout" class="button primary">Start another returning-customer purchase →</button><a class="text-button" href="/new-customer">Test with a different buyer</a></div>
           <p class="fine-print">This page uses the latest saved vault ID from the new-customer checkout.</p>

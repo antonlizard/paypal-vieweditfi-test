@@ -5,7 +5,7 @@ import vm from "node:vm";
 
 const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
 const savedBuyer = { revision: "revision-1", vaultId: "server-vault-1", state: "VAULTED", savedAt: new Date().toISOString() };
-const complete = { id: "ORDER00001", status: "COMPLETED", completed: true, purchase_units: [{ payments: { captures: [{ status: "COMPLETED" }] } }] };
+const complete = { id: "ORDER00001", status: "COMPLETED", completed: true, purchase_units: [{ payments: { captures: [{ id: "CAPTURE00001", status: "COMPLETED" }] } }] };
 
 // This exercises browser event logic and SDK configuration with a fake DOM and
 // PayPal SDK. It is a contract test, not visual/browser or real-PayPal testing.
@@ -93,9 +93,15 @@ test("editing captures only the approved order and disables the direct-charge bu
   const page = browser("returning");
   await page.ready();
   assert.equal(await page.callbacks.createOrder(), complete.id);
+  assert.equal(page.element("payment-details").hidden, false);
+  assert.equal(page.element("payment-order-id").textContent, complete.id);
+  assert.equal(page.element("payment-capture-details").hidden, true);
   assert.equal(page.element("place-order").disabled, true);
   await page.callbacks.onApprove({ orderID: complete.id });
   assert.match(page.element("status").textContent, /Payment completed/);
+  assert.equal(page.element("payment-capture-details").hidden, false);
+  assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+  assert.equal(page.element("payment-details").hidden, false);
   await page.element("place-order").events.click();
   assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
   assert.equal(page.requests.filter((request) => request.path === "/api/direct-charge").length, 0);
@@ -119,6 +125,27 @@ test("a lost direct-charge response blocks editing and recovers using the origin
   assert.equal(calls.length, 2);
   assert.equal(calls[0].body.requestId, calls[1].body.requestId);
   assert.match(page.element("status").textContent, /Payment completed/);
+  assert.equal(page.element("payment-order-id").textContent, complete.id);
+  assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+});
+
+test("a pending capture shows its order ID and reveals the transaction ID only after completion", async () => {
+  const page = browser("returning", (path) => {
+    if (path.endsWith("/capture")) return { order: {
+      id: complete.id, status: "COMPLETED", completed: false,
+      purchase_units: [{ payments: { captures: [{ id: "PENDING00001", status: "PENDING" }] } }],
+    } };
+    if (path === `/api/orders/${complete.id}`) return { order: complete };
+  });
+  await page.ready();
+  await page.callbacks.createOrder();
+  await page.callbacks.onApprove({ orderID: complete.id });
+  assert.equal(page.element("payment-order-id").textContent, complete.id);
+  assert.equal(page.element("payment-capture-details").hidden, true);
+  assert.equal(page.element("payment-capture-id").textContent, "—");
+  await page.element("check-status").events.click();
+  assert.equal(page.element("payment-capture-details").hidden, false);
+  assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
 });
 
 test("empty returning state makes no SDK or payment calls", async () => {

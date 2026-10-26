@@ -76,10 +76,23 @@ function showBuyer(value) {
   $("saved-at").textContent = value?.savedAt ? new Date(value.savedAt).toLocaleString() : "—";
 }
 
+function showPaymentDetails(order) {
+  if (flow !== "returning") return;
+  $("payment-details").hidden = !order?.id;
+  $("payment-order-id").textContent = order?.id || "—";
+  const captureIds = (order?.purchase_units || []).flatMap((unit) =>
+    (unit.payments?.captures || []).filter((capture) => capture.status === "COMPLETED" && capture.id).map((capture) => capture.id),
+  );
+  $("payment-capture-details").hidden = captureIds.length === 0;
+  $("payment-capture-label").textContent = captureIds.length > 1 ? "Transaction IDs (capture IDs)" : "Transaction ID (capture ID)";
+  $("payment-capture-id").textContent = captureIds.join(", ") || "—";
+}
+
 async function finish(result) {
   const order = result.order;
   if (!order?.id) throw new Error("The server did not return an order ID.");
   lastOrderId = order.id;
+  showPaymentDetails(order);
   log("Orders v2 response", order);
   paid = order.completed === true;
   unresolved = !paid;
@@ -97,6 +110,7 @@ async function finish(result) {
 async function createOrder() {
   if (paid || unresolved) throw new Error("This checkout already submitted a payment. Start a new purchase after checking its result.");
   busy = true;
+  showPaymentDetails(null);
   controls();
   status("Creating the PayPal order…");
   try {
@@ -106,6 +120,8 @@ async function createOrder() {
       ...(flow === "returning" ? { vaultRevision: buyer.revision } : {}),
     });
     lastOrderId = result.order.id;
+    showPaymentDetails(result.order);
+    if (flow === "returning") status("Order created. Complete approval in PayPal.");
     log("Order created", result.order);
     return result.order.id;
   } catch (error) {
@@ -119,6 +135,7 @@ async function onApprove(data) {
   controls();
   status("Capturing the approved PayPal order…");
   lastOrderId = data.orderID;
+  showPaymentDetails({ id: data.orderID });
   try {
     await finish(await api(`/api/orders/${encodeURIComponent(data.orderID)}/capture`, {}));
   } catch (error) {

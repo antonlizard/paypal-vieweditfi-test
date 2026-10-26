@@ -13,6 +13,8 @@ This is a **sandbox-only integration test**. It defaults to a $10.00 USD purchas
 
 Both pages display the shared saved buyer and an expandable activity panel. The returning page shows an empty state until a payment method is available. No simulated funding instrument is displayed.
 
+The returning page displays the Order ID as soon as ViewEditFI creates the order, followed by the Transaction ID (capture ID) once capture completes. These details also appear for payments made directly with the saved method and for recovered payment results.
+
 ## Deploy this repository to Cloudflare
 
 Source repository: [antonlizard/paypal-vieweditfi-test](https://github.com/antonlizard/paypal-vieweditfi-test).
