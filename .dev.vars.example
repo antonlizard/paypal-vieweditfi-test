@@ -1,0 +1,7 @@
+# Copy to .dev.vars for local development. Never commit real credentials.
+PAYPAL_CLIENT_ID="your-sandbox-client-id"
+PAYPAL_CLIENT_SECRET="your-sandbox-client-secret"
+BASIC_AUTH_USERNAME="editfi"
+BASIC_AUTH_PASSWORD="replace-with-a-long-random-password"
+# Optional: register /api/paypal/webhook with PayPal for asynchronous vaulting.
+# PAYPAL_WEBHOOK_ID="your-sandbox-webhook-id"

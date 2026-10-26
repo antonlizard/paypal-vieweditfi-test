@@ -1,0 +1,25 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "paypal-vieweditfi-test",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-10-26",
+  "workers_dev": true,
+  "keep_vars": true,
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true,
+    "html_handling": "none",
+    "not_found_handling": "none"
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "VAULT_STORE", "class_name": "VaultStore" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["VaultStore"] }],
+  "vars": {
+    "PAYPAL_ENV": "sandbox",
+    "PAYPAL_CURRENCY": "EUR",
+    "PAYPAL_AMOUNT": "10.00"
+  },
+  "observability": { "enabled": false }
+}

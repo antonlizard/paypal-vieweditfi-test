@@ -1,0 +1,130 @@
+export class AppError extends Error {
+  constructor(status, code, message, details = undefined) {
+    super(message);
+    Object.assign(this, { status, code, details });
+  }
+}
+
+export function config(env) {
+  // This harness intentionally uses sandbox endpoints only.
+  if (env.PAYPAL_ENV && env.PAYPAL_ENV !== "sandbox") {
+    throw new AppError(503, "SANDBOX_ONLY", "Use PAYPAL_ENV=sandbox for this test application.");
+  }
+  if (!env.PAYPAL_CLIENT_ID || !env.PAYPAL_CLIENT_SECRET) {
+    throw new AppError(503, "PAYPAL_NOT_CONFIGURED", "Set PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET on the Worker.");
+  }
+  const currency = env.PAYPAL_CURRENCY || "USD";
+  const amount = env.PAYPAL_AMOUNT || "10.00";
+  if (!/^[A-Z]{3}$/.test(currency) || !/^\d{1,5}\.\d{2}$/.test(amount) || Number(amount) <= 0) {
+    throw new AppError(503, "INVALID_AMOUNT", "Configure a positive PAYPAL_AMOUNT with two decimal places and a three-letter PAYPAL_CURRENCY.");
+  }
+  return {
+    clientId: env.PAYPAL_CLIENT_ID,
+    environment: "sandbox",
+    apiBase: "https://api-m.sandbox.paypal.com",
+    sdkBase: "https://www.sandbox.paypal.com",
+    currency,
+    amount,
+  };
+}
+
+function basic(clientId, secret) {
+  return btoa(`${clientId}:${secret}`);
+}
+
+export class PayPal {
+  constructor(env, transport = fetch) {
+    this.env = env;
+    this.settings = config(env);
+    this.transport = transport;
+    this.accessToken = null;
+  }
+
+  async request(path, init) {
+    let response;
+    try {
+      response = await this.transport(this.settings.apiBase + path, {
+        ...init,
+        signal: AbortSignal.timeout(20000),
+      });
+    } catch {
+      throw new AppError(502, "PAYPAL_UNREACHABLE", "PayPal did not respond. Retry the same operation; its payment idempotency key is preserved.");
+    }
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      // Do not forward raw OAuth bodies, headers, or credentials to the browser.
+      throw new AppError(502, "PAYPAL_API_ERROR", body.message || body.error_description || "PayPal rejected the request.", {
+        httpStatus: response.status,
+        name: body.name || body.error,
+        debugId: body.debug_id || response.headers.get("paypal-debug-id"),
+        issues: body.details?.map(({ issue, description, field }) => ({ issue, description, field })),
+      });
+    }
+    return body;
+  }
+
+  async oauth(extra = {}) {
+    return this.request("/v1/oauth2/token", {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${basic(this.settings.clientId, this.env.PAYPAL_CLIENT_SECRET)}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({ grant_type: "client_credentials", ...extra }),
+    });
+  }
+
+  async token() {
+    if (!this.accessToken || this.accessToken.expiresAt <= Date.now()) {
+      const result = await this.oauth();
+      if (!result.access_token) throw new AppError(502, "INVALID_OAUTH_RESPONSE", "PayPal did not return an access token.");
+      this.accessToken = {
+        value: result.access_token,
+        expiresAt: Date.now() + Math.max(0, (result.expires_in || 300) - 60) * 1000,
+      };
+    }
+    return this.accessToken.value;
+  }
+
+  async clientToken(vaultId) {
+    // The guide requires claims[] and response_type=client_token, NOT a
+    // generic /v1/identity/generate-token client token or a top-level vault_id.
+    const result = await this.oauth({
+      response_type: "client_token",
+      "claims[]": `vault_id:${vaultId}`,
+    });
+    if (!result.access_token) throw new AppError(502, "INVALID_CLIENT_TOKEN", "PayPal did not return a vault-scoped client token.");
+    return { clientToken: result.access_token, expiresIn: result.expires_in };
+  }
+
+  async api(path, { method = "GET", body, requestId } = {}) {
+    return this.request(path, {
+      method,
+      headers: {
+        Authorization: `Bearer ${await this.token()}`,
+        "Content-Type": "application/json",
+        Prefer: "return=representation",
+        ...(requestId ? { "PayPal-Request-Id": requestId } : {}),
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+  }
+}
+
+export function isCompleted(order) {
+  return order?.status === "COMPLETED" && order.purchase_units?.some(
+    (unit) => unit.payments?.captures?.some((capture) => capture.status === "COMPLETED"),
+  );
+}
+
+export function json(value, status = 200) {
+  return Response.json(value, { status, headers: { "Cache-Control": "no-store" } });
+}
+
+export function errorResponse(error) {
+  return json({
+    error: error instanceof AppError ? error.code : "INTERNAL_ERROR",
+    message: error instanceof AppError ? error.message : "The request could not be completed.",
+    ...(error instanceof AppError && error.details ? { details: error.details } : {}),
+  }, error instanceof AppError ? error.status : 500);
+}

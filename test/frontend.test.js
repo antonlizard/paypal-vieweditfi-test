@@ -1,0 +1,138 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import vm from "node:vm";
+
+const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+const savedBuyer = { revision: "revision-1", vaultId: "server-vault-1", state: "VAULTED", savedAt: new Date().toISOString() };
+const complete = { id: "ORDER00001", status: "COMPLETED", completed: true, purchase_units: [{ payments: { captures: [{ status: "COMPLETED" }] } }] };
+
+// This exercises browser event logic and SDK configuration with a fake DOM and
+// PayPal SDK. It is a contract test, not visual/browser or real-PayPal testing.
+function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, hasComponent = true) {
+  const elements = new Map(), scripts = [], renders = [], requests = [], storage = new Map();
+  let callbacks;
+  function element(id) {
+    if (!elements.has(id)) elements.set(id, {
+      hidden: false, disabled: false, textContent: "", className: "", events: {},
+      addEventListener(event, handler) { this.events[event] = handler; },
+      querySelector(selector) { return element(`${id}:${selector}`); },
+      setAttribute(name, value) { this[name] = value; },
+    });
+    return elements.get(id);
+  }
+  const paypal = {
+    FUNDING: { PAYPAL: "paypal" },
+    Buttons(options) { callbacks = options; return { async render(selector) { renders.push(selector); } }; },
+    ...(hasComponent ? { SavedPaymentMethods(options) { callbacks = options; return { async render(selector) { renders.push(selector); } }; } } : {}),
+  };
+  const context = vm.createContext({
+    document: {
+      body: { dataset: { flow } }, getElementById: element,
+      querySelectorAll: () => [element("amount-1"), element("amount-2")],
+      createElement: () => element(`script-${scripts.length}`),
+      head: { appendChild(script) { scripts.push(script); queueMicrotask(() => script.onload()); } },
+    },
+    window: { paypal },
+    location: { search: "", pathname: `/${flow === "new" ? "new" : "returning"}-customer`, reload() {} },
+    history: { replaceState() {} },
+    sessionStorage: { getItem: (key) => storage.get(key) || null, setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) },
+    crypto, URLSearchParams, Intl, Date,
+    fetch: async (path, init) => {
+      const body = init.body ? JSON.parse(init.body) : undefined;
+      requests.push({ path, body, init });
+      const custom = await backend(path, body);
+      if (custom !== undefined) return Response.json(custom);
+      if (path === "/api/config") return Response.json({ clientId: "public-client-id", sdkBase: "https://www.sandbox.paypal.com", environment: "sandbox", currency: "USD", amount: "10.00" });
+      if (path === "/api/state") return Response.json({ buyer: initialBuyer });
+      if (path === "/api/client-token") return Response.json({ clientToken: "scoped-test-token", expiresIn: 32400 });
+      if (path === "/api/orders") return Response.json({ order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" } });
+      if (path.endsWith("/capture") || path === "/api/direct-charge") return Response.json({ order: complete });
+      throw new Error(`Unexpected API call: ${path}`);
+    },
+  });
+  vm.runInContext(source, context);
+  async function ready() {
+    for (let count = 0; count < 100; count++) {
+      if (renders.length || element("status").className.includes("error") || element("status").textContent.startsWith("Create a saved")) return;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.fail("Frontend did not finish initialization");
+  }
+  return { ready, element, scripts, renders, requests, storage, get callbacks() { return callbacks; } };
+}
+
+test("new page loads SDK v5 with vaulting and only renders PayPal Buttons", async () => {
+  const page = browser("new");
+  await page.ready();
+  const sdk = new URL(page.scripts[0].src);
+  assert.equal(sdk.pathname, "/sdk/js");
+  assert.equal(sdk.searchParams.get("components"), "buttons");
+  assert.equal(sdk.searchParams.get("vault"), "true");
+  assert.deepEqual(page.renders, ["#paypal-button-container"]);
+  assert.equal(page.requests.some((request) => request.path === "/api/client-token"), false);
+});
+
+test("returning page scopes SDK through its data attribute and all four required components", async () => {
+  const page = browser("returning");
+  await page.ready();
+  const script = page.scripts[0];
+  const sdk = new URL(script.src);
+  assert.equal(sdk.searchParams.get("components"), "buttons,funding-eligibility,messages,saved-payment-methods");
+  assert.equal(script["data-sdk-client-token"], "scoped-test-token");
+  assert.equal(sdk.searchParams.has("client-token"), false);
+  assert.equal(sdk.searchParams.has("vault-id"), false);
+  assert.equal(page.callbacks.vaultId, undefined);
+  assert.deepEqual(page.renders, ["#saved-payment-methods-container"]);
+  assert.equal(page.element("place-order").disabled, false);
+  assert.equal(page.element("activity").textContent.includes("scoped-test-token"), false);
+  assert.ok(!JSON.stringify([...page.storage]).includes(savedBuyer.vaultId));
+});
+
+test("editing captures only the approved order and disables the direct-charge button after success", async () => {
+  const page = browser("returning");
+  await page.ready();
+  assert.equal(await page.callbacks.createOrder(), complete.id);
+  assert.equal(page.element("place-order").disabled, true);
+  await page.callbacks.onApprove({ orderID: complete.id });
+  assert.match(page.element("status").textContent, /Payment completed/);
+  await page.element("place-order").events.click();
+  assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
+  assert.equal(page.requests.filter((request) => request.path === "/api/direct-charge").length, 0);
+});
+
+test("a lost direct-charge response blocks editing and recovers using the original request ID", async () => {
+  let attempts = 0;
+  const page = browser("returning", (path) => {
+    if (path === "/api/direct-charge") {
+      if (++attempts === 1) throw new Error("connection lost");
+      return { order: complete };
+    }
+  });
+  await page.ready();
+  await page.element("place-order").events.click();
+  assert.equal(page.element("place-order").disabled, true);
+  assert.equal(page.element("check-status").hidden, false);
+  await assert.rejects(page.callbacks.createOrder(), /already submitted/);
+  await page.element("check-status").events.click();
+  const calls = page.requests.filter((request) => request.path === "/api/direct-charge");
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].body.requestId, calls[1].body.requestId);
+  assert.match(page.element("status").textContent, /Payment completed/);
+});
+
+test("empty returning state makes no SDK or payment calls", async () => {
+  const page = browser("returning", undefined, null);
+  await page.ready();
+  assert.equal(page.scripts.length, 0);
+  assert.equal(page.element("empty-state").hidden, false);
+  assert.equal(page.requests.length, 2);
+});
+
+test("missing beta component produces a clear error without substituting another payment UI", async () => {
+  const page = browser("returning", undefined, savedBuyer, false);
+  await page.ready();
+  assert.match(page.element("status").textContent, /did not expose SavedPaymentMethods/);
+  assert.equal(page.renders.length, 0);
+  assert.equal(page.element("place-order").disabled, true);
+});
