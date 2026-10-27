@@ -60,6 +60,7 @@ export class PayPal {
     // instance as its receiver and throw before any HTTP request is sent.
     this.transport = transport.bind(globalThis);
     this.accessToken = null;
+    this.tokenRequest = null;
   }
 
   safeTrace(value) {
@@ -127,15 +128,30 @@ export class PayPal {
   }
 
   async token() {
-    if (!this.accessToken || this.accessToken.expiresAt <= Date.now()) {
-      const result = await this.oauth();
-      if (!result.access_token) throw new AppError(502, "INVALID_OAUTH_RESPONSE", "PayPal did not return an access token.");
-      this.accessToken = {
-        value: result.access_token,
-        expiresAt: Date.now() + Math.max(0, (result.expires_in || 300) - 60) * 1000,
-      };
+    if (this.accessToken?.expiresAt > Date.now()) return this.accessToken.value;
+    if (!this.tokenRequest) {
+      // Count PayPal's lifetime in seconds from the start of the exchange so
+      // network time cannot extend it. Keep the token only in backend memory.
+      const requestedAt = Date.now();
+      this.tokenRequest = (async () => {
+        const result = await this.oauth();
+        if (typeof result.access_token !== "string" || !result.access_token.trim()) {
+          throw new AppError(502, "INVALID_OAUTH_RESPONSE", "PayPal did not return an access token.");
+        }
+        if (!Number.isSafeInteger(result.expires_in) || result.expires_in <= 0 ||
+            !Number.isSafeInteger(requestedAt + result.expires_in * 1000)) {
+          throw new AppError(502, "INVALID_OAUTH_RESPONSE", "PayPal did not return a valid access token lifetime in expires_in.");
+        }
+        this.accessToken = {
+          value: result.access_token,
+          expiresAt: requestedAt + result.expires_in * 1000,
+        };
+        return this.accessToken.value;
+      })().finally(() => { this.tokenRequest = null; });
     }
-    return this.accessToken.value;
+    // Concurrent callers share the exchange, including an expired-token
+    // renewal. A failed exchange is cleared so a later action can retry it.
+    return this.tokenRequest;
   }
 
   async clientToken(vaultId) {

@@ -7,6 +7,121 @@ const env = {
   PAYPAL_CLIENT_SECRET: "test-secret",
 };
 
+test("Orders calls reuse the REST token until expires_in elapses and cache each renewal", async (t) => {
+  const startedAt = 1_000_000;
+  let now = startedAt, exchanges = 0;
+  const authorizations = [];
+  t.mock.method(Date, "now", () => now);
+  const paypal = new PayPal(env, async (url, init) => {
+    if (url.endsWith("/v1/oauth2/token")) {
+      exchanges++;
+      now += 250; // The network round trip must not extend the token's lifetime.
+      return Response.json({ access_token: `rest-token-${exchanges}`, expires_in: exchanges === 1 ? 120 : 300 });
+    }
+    authorizations.push(init.headers.Authorization);
+    return Response.json({ id: "ORDER00001" });
+  });
+  await paypal.api("/v2/checkout/orders", { method: "POST", body: {} });
+  assert.equal(exchanges, 1);
+  assert.equal(paypal.accessToken.expiresAt, startedAt + 120_000);
+  now = startedAt + 119_999;
+  await paypal.api("/v2/checkout/orders/ORDER00001/capture", { method: "POST", body: {} });
+  assert.equal(exchanges, 1, "The token remains cached during its final minute");
+  now = startedAt + 120_000;
+  await paypal.api("/v2/checkout/orders", { method: "POST", body: {} });
+  assert.equal(exchanges, 2, "Renew at the exact expiry boundary");
+  now = startedAt + 419_999;
+  await paypal.api("/v2/checkout/orders/ORDER00001/capture", { method: "POST", body: {} });
+  assert.equal(exchanges, 2, "Use the new token's own reported lifetime");
+  now = startedAt + 420_000;
+  await paypal.api("/v2/checkout/orders/ORDER00001");
+  assert.equal(exchanges, 3);
+  assert.deepEqual(authorizations, [
+    "Bearer rest-token-1", "Bearer rest-token-1", "Bearer rest-token-2", "Bearer rest-token-2", "Bearer rest-token-3",
+  ]);
+});
+
+test("concurrent callers share one OAuth exchange on initial acquisition and expiry", async (t) => {
+  let now = 1_000_000, exchanges = 0, respond;
+  t.mock.method(Date, "now", () => now);
+  const paypal = new PayPal(env, () => {
+    exchanges++;
+    return new Promise((resolve) => { respond = resolve; });
+  });
+  for (const token of ["first-rest-token", "renewed-rest-token"]) {
+    const requests = Array.from({ length: 5 }, () => paypal.token());
+    assert.equal(exchanges, token === "first-rest-token" ? 1 : 2);
+    respond(Response.json({ access_token: token, expires_in: 120 }));
+    assert.deepEqual(await Promise.all(requests), Array(5).fill(token));
+    assert.equal(await paypal.token(), token);
+    now += 120_000;
+  }
+  assert.equal(exchanges, 2);
+});
+
+test("failed renewal does not send an expired token and the next call can retry", async (t) => {
+  let now = 1_000_000, exchanges = 0;
+  const authorizations = [];
+  t.mock.method(Date, "now", () => now);
+  const paypal = new PayPal(env, async (url, init) => {
+    if (url.endsWith("/v1/oauth2/token")) {
+      exchanges++;
+      if (exchanges === 2) return Response.json({ error: "temporarily_unavailable" }, { status: 503 });
+      return Response.json({ access_token: `rest-token-${exchanges}`, expires_in: 120 });
+    }
+    authorizations.push(init.headers.Authorization);
+    return Response.json({ id: "ORDER00001" });
+  });
+  await paypal.api("/v2/checkout/orders");
+  now += 120_000;
+  await assert.rejects(paypal.api("/v2/checkout/orders"), { code: "PAYPAL_API_ERROR" });
+  assert.deepEqual(authorizations, ["Bearer rest-token-1"]);
+  await paypal.api("/v2/checkout/orders");
+  await paypal.api("/v2/checkout/orders");
+  assert.equal(exchanges, 3);
+  assert.deepEqual(authorizations, ["Bearer rest-token-1", "Bearer rest-token-3", "Bearer rest-token-3"]);
+});
+
+test("missing or invalid OAuth lifetimes are rejected instead of assuming a cache duration", async () => {
+  for (const lifetime of [undefined, null, 0, -1, "120", 1.5, Number.MAX_SAFE_INTEGER]) {
+    let exchanges = 0, orders = 0;
+    const paypal = new PayPal(env, async (url) => {
+      if (url.endsWith("/v1/oauth2/token")) {
+        exchanges++;
+        return Response.json({ access_token: "rest-token", expires_in: exchanges === 1 ? lifetime : 120 });
+      }
+      orders++;
+      return Response.json({ id: "ORDER00001" });
+    });
+    await assert.rejects(paypal.api("/v2/checkout/orders"), { code: "INVALID_OAUTH_RESPONSE" });
+    assert.equal(orders, 0);
+    assert.equal(paypal.accessToken, null);
+    await paypal.api("/v2/checkout/orders");
+    assert.equal(exchanges, 2);
+    assert.equal(orders, 1);
+  }
+});
+
+test("vault-scoped SDK tokens do not replace the cached REST access token", async () => {
+  let restExchanges = 0, sdkExchanges = 0;
+  const authorizations = [];
+  const paypal = new PayPal(env, async (url, init) => {
+    if (url.endsWith("/v1/oauth2/token")) {
+      const scoped = init.body.get("response_type") === "client_token";
+      if (scoped) sdkExchanges++; else restExchanges++;
+      return Response.json({ access_token: scoped ? "scoped-sdk-token" : "cached-rest-token", expires_in: 120 });
+    }
+    authorizations.push(init.headers.Authorization);
+    return Response.json({ id: "ORDER00001" });
+  });
+  await paypal.api("/v2/checkout/orders");
+  assert.deepEqual(await paypal.clientToken("saved-vault"), { clientToken: "scoped-sdk-token", expiresIn: 120 });
+  await paypal.api("/v2/checkout/orders");
+  assert.equal(restExchanges, 1);
+  assert.equal(sdkExchanges, 1);
+  assert.deepEqual(authorizations, ["Bearer cached-rest-token", "Bearer cached-rest-token"]);
+});
+
 test("native Worker fetch keeps its global receiver for OAuth, Orders, and SDK tokens", async (t) => {
   const calls = [];
   // workerd rejects an unrelated receiver before sending any HTTP request.
