@@ -19,11 +19,11 @@ const savedCreateTrace = { ...createTrace, request: { ...createTrace.request, he
 // This exercises browser event logic and SDK configuration with a fake DOM and
 // PayPal SDK. It is a contract test, not visual/browser or real-PayPal testing.
 function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, hasComponent = true, options = {}) {
-  const elements = new Map(), scripts = [], renders = [], requests = [], storage = new Map(options.storage);
-  let callbacks;
+  const elements = new Map(), scripts = [], renders = [], cardRenders = [], cardSubmissions = [], requests = [], storage = new Map(options.storage);
+  let callbacks, cardCallbacks;
   function element(id) {
     if (!elements.has(id)) elements.set(id, {
-      hidden: false, disabled: false, textContent: "", className: "", events: {},
+      hidden: false, disabled: false, open: false, value: "", textContent: "", className: "", events: {},
       addEventListener(event, handler) { this.events[event] = handler; },
       querySelector(selector) { return element(`${id}:${selector}`); },
       setAttribute(name, value) { this[name] = value; },
@@ -34,6 +34,23 @@ function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, has
     FUNDING: { PAYPAL: "paypal" },
     Buttons(options) { callbacks = options; return { async render(selector) { renders.push(selector); } }; },
     ...(hasComponent ? { SavedPaymentMethods(options) { callbacks = options; return { async render(selector) { renders.push(selector); } }; } } : {}),
+    CardFields(configuration) {
+      cardCallbacks = configuration;
+      const render = () => ({ async render(selector) { cardRenders.push(selector); } });
+      return {
+        isEligible: () => options.cardEligible !== false,
+        NameField: render, NumberField: render, ExpiryField: render, CVVField: render,
+        async getState() { return { isFormValid: options.cardValid !== false }; },
+        async submit(values) {
+          cardSubmissions.push(values);
+          const orderID = await configuration.createOrder();
+          if (options.cardFailure) throw new Error("Card validation failed with private SDK details");
+          if (options.cardConfirmWait) await options.cardConfirmWait;
+          await configuration.onApprove({ orderID });
+          if (options.duplicateCardApproval) await configuration.onApprove({ orderID });
+        },
+      };
+    },
   };
   const context = vm.createContext({
     document: {
@@ -42,7 +59,8 @@ function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, has
       createElement: () => element(`script-${scripts.length}`),
       head: { appendChild(script) { scripts.push(script); queueMicrotask(() => script.onload()); } },
     },
-    window: { paypal },
+    window: { paypal, ...(options.applePay ? { ApplePaySession: function () {} } : {}) },
+    navigator: { userAgent: options.userAgent || "Chrome/130.0 Safari/537.36", platform: options.platform || "Linux x86_64" },
     location: { search: options.search || "", pathname: `/${flow === "new" ? "new" : "returning"}-customer`, reload() {} },
     history: { replaceState() {} },
     sessionStorage: { getItem: (key) => storage.get(key) || null, setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) },
@@ -69,20 +87,29 @@ function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, has
   vm.runInContext(source, context);
   async function ready() {
     for (let count = 0; count < 100; count++) {
-      if (renders.length || element("status").className.includes("error") || element("status").textContent.startsWith("Create a saved")) return;
+      if (cardCallbacks || renders.length || element("status").className.includes("error") || element("status").className.includes("success")) return;
       await new Promise((resolve) => setImmediate(resolve));
     }
     assert.fail("Frontend did not finish initialization");
   }
-  return { ready, element, scripts, renders, requests, storage, get callbacks() { return callbacks; } };
+  async function openCard() {
+    element("card-option").open = true;
+    await element("card-option").events.toggle?.();
+    element("billing-line1").value = "Test street 1";
+    element("billing-city").value = "Berlin";
+    element("billing-postal").value = "10115";
+    element("billing-country").value = "DE";
+  }
+  const submitCard = () => element("card-form").events.submit({ preventDefault() {} });
+  return { ready, openCard, submitCard, element, scripts, renders, cardRenders, cardSubmissions, requests, storage, get callbacks() { return callbacks; }, get cardCallbacks() { return cardCallbacks; } };
 }
 
-test("new page loads SDK v5 with vaulting and only renders PayPal Buttons", async () => {
+test("new page loads SDK v5 with vaulting, PayPal Buttons and Card Fields", async () => {
   const page = browser("new");
   await page.ready();
   const sdk = new URL(page.scripts[0].src);
   assert.equal(sdk.pathname, "/sdk/js");
-  assert.equal(sdk.searchParams.get("components"), "buttons");
+  assert.equal(sdk.searchParams.get("components"), "buttons,card-fields");
   assert.equal(sdk.searchParams.get("vault"), "true");
   assert.equal(sdk.searchParams.get("commit"), "true");
   assert.deepEqual(page.renders, ["#paypal-button-container"]);
@@ -98,7 +125,7 @@ test("returning page scopes SDK through its data attribute and all four required
   await page.ready();
   const script = page.scripts[0];
   const sdk = new URL(script.src);
-  assert.equal(sdk.searchParams.get("components"), "buttons,funding-eligibility,messages,saved-payment-methods");
+  assert.equal(sdk.searchParams.get("components"), "buttons,funding-eligibility,messages,saved-payment-methods,card-fields");
   assert.equal(script["data-sdk-client-token"], "scoped-test-token");
   assert.equal(sdk.searchParams.has("client-token"), false);
   assert.equal(sdk.searchParams.has("vault-id"), false);
@@ -309,10 +336,13 @@ for (const settled of [false, true]) {
   });
 }
 
-test("empty returning state makes no SDK or payment calls", async () => {
+test("empty returning state still loads Card Fields without a vault-scoped token or payment calls", async () => {
   const page = browser("returning", undefined, null);
   await page.ready();
-  assert.equal(page.scripts.length, 0);
+  assert.equal(page.scripts.length, 1);
+  assert.equal(new URL(page.scripts[0].src).searchParams.get("components"), "buttons,card-fields");
+  assert.equal(page.scripts[0]["data-sdk-client-token"], undefined);
+  assert.equal(page.renders.length, 0);
   assert.equal(page.element("empty-state").hidden, false);
   assert.equal(page.requests.length, 2);
 });
@@ -324,3 +354,160 @@ test("missing beta component produces a clear error without substituting another
   assert.equal(page.renders.length, 0);
   assert.equal(page.element("place-order").disabled, true);
 });
+
+for (const flow of ["new", "returning"]) {
+  test(`${flow} page performs a hosted card checkout independently of the saved PayPal buyer`, async () => {
+    const page = browser(flow, undefined, flow === "returning" ? null : savedBuyer, true, { duplicateCardApproval: true });
+    await page.ready();
+    await page.openCard();
+    assert.deepEqual(page.cardRenders, ["#card-name-field", "#card-number-field", "#card-expiry-field", "#card-cvv-field"]);
+    assert.equal(page.element("card-submit").disabled, false);
+    await Promise.all([page.submitCard(), page.submitCard()]);
+    const creates = page.requests.filter((request) => request.path === "/api/orders");
+    assert.equal(creates.length, 1);
+    assert.equal(creates[0].body.flow, "card");
+    assert.equal(creates[0].body.page, flow);
+    assert.deepEqual(Object.keys(creates[0].body).sort(), ["flow", "page", "requestId"]);
+    assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
+    assert.equal(page.requests.some((request) => request.path === "/api/direct-charge"), false);
+    assert.equal(page.element("payment-order-id").textContent, complete.id);
+    assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+    assert.match(page.element("status").textContent, /Card payment completed/);
+    assert.equal(page.element("status").textContent.includes("Vaulting is pending"), false);
+    assert.equal(page.element("alternative-controls").hidden, true);
+    assert.equal(page.cardSubmissions[0].billingAddress.countryCode, "DE");
+    assert.equal(page.cardSubmissions[0].billingAddress.adminArea2, "Berlin");
+    for (const privateValue of ["Test street 1", "10115", "Berlin"]) {
+      assert.equal(JSON.stringify(page.requests).includes(privateValue), false);
+      assert.equal(JSON.stringify([...page.storage]).includes(privateValue), false);
+      assert.equal(page.element("activity").textContent.includes(privateValue), false);
+    }
+  });
+}
+
+test("invalid hosted card fields do not create an order or capture payment", async () => {
+  const page = browser("new", undefined, savedBuyer, true, { cardValid: false });
+  await page.ready();
+  await page.openCard();
+  await page.submitCard();
+  assert.equal(page.requests.some((request) => request.path === "/api/orders" || request.path.endsWith("/capture")), false);
+  assert.match(page.element("status").textContent, /Check the card number/);
+  assert.equal(page.element("card-submit").disabled, false);
+});
+
+test("a card authentication challenge stays interactive while other payment submissions are locked", async () => {
+  let release;
+  const cardConfirmWait = new Promise((resolve) => { release = resolve; });
+  const page = browser("new", undefined, savedBuyer, true, { cardConfirmWait });
+  await page.ready();
+  await page.openCard();
+  const payment = page.submitCard();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(page.element("alternative-controls").inert, false);
+  assert.equal(page.element("checkout-controls").inert, true);
+  assert.equal(page.element("card-submit").disabled, true);
+  await page.submitCard();
+  await page.callbacks.onApprove({ orderID: "OLDPAYPALORDER" });
+  assert.equal(page.requests.filter((request) => request.path === "/api/orders").length, 1);
+  assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+  release();
+  await payment;
+  assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
+});
+
+test("ineligible Card Fields show an actionable message and preserve PayPal checkout", async () => {
+  const page = browser("new", undefined, savedBuyer, true, { cardEligible: false });
+  await page.ready();
+  assert.equal(page.element("card-form").hidden, true);
+  assert.match(page.element("card-status").textContent, /Enable Advanced Credit and Debit Card Payments/);
+  assert.deepEqual(page.renders, ["#paypal-button-container"]);
+  await page.callbacks.createOrder();
+  await page.callbacks.onApprove({ orderID: complete.id });
+  assert.match(page.element("status").textContent, /Payment completed/);
+});
+
+test("a lost card capture response checks status without charging again and allows explicit capture recovery", async () => {
+  let captures = 0;
+  const page = browser("returning", (path) => {
+    if (path.endsWith("/capture") && ++captures === 1) throw new Error("response lost");
+    if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "APPROVED" }, traces: { create: savedCreateTrace } };
+  });
+  await page.ready();
+  await page.openCard();
+  await page.submitCard();
+  assert.equal(page.element("check-status").hidden, false);
+  assert.equal(page.element("card-submit").disabled, true);
+  await page.element("check-status").events.click();
+  assert.equal(captures, 1);
+  assert.equal(page.element("resume-card").hidden, false);
+  await page.element("resume-card").events.click();
+  assert.equal(captures, 2);
+  assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+});
+
+test("a pending card capture cannot be submitted again using the approval recovery button", async () => {
+  const page = browser("new", (path) => {
+    if (path.endsWith("/capture")) return { order: {
+      id: complete.id, status: "COMPLETED", completed: false,
+      purchase_units: [{ payments: { captures: [{ id: "PENDING00001", status: "PENDING" }] } }],
+    } };
+  });
+  await page.ready();
+  await page.openCard();
+  await page.submitCard();
+  assert.equal(page.element("resume-card").hidden, true);
+  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("check-status").hidden, false);
+  await page.element("resume-card").events.click();
+  assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
+});
+
+test("a failed card confirmation is recovered using the same order creation key", async () => {
+  const page = browser("new", (path) => {
+    if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" } };
+  }, savedBuyer, true, { cardFailure: true });
+  await page.ready();
+  await page.openCard();
+  await page.submitCard();
+  assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+  assert.equal(page.element("activity").textContent.includes("private SDK details"), false);
+  await page.element("check-status").events.click();
+  assert.equal(page.element("card-submit").disabled, false);
+  await page.submitCard();
+  const creates = page.requests.filter((request) => request.path === "/api/orders");
+  assert.equal(creates.length, 2);
+  assert.equal(creates[0].body.requestId, creates[1].body.requestId);
+});
+
+test("reload and card redirects restore approved card orders without an automatic capture", async () => {
+  const initial = browser("new", undefined, savedBuyer, true, { cardFailure: true });
+  await initial.ready();
+  await initial.openCard();
+  await initial.submitCard();
+  const page = browser("new", (path) => {
+    if (path.startsWith("/api/operations/")) return { order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" }, flow: "card" };
+    if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "APPROVED" } };
+  }, savedBuyer, true, { storage: initial.storage, search: `?card=return&token=${complete.id}` });
+  await page.ready();
+  assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+  assert.equal(page.element("resume-card").hidden, false);
+  await page.element("resume-card").events.click();
+  assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
+});
+
+for (const scenario of [
+  { name: "Safari on macOS", userAgent: "Mozilla/5.0 Macintosh Version/18.0 Safari/605.1.15", platform: "MacIntel", wallet: "Apple Pay" },
+  { name: "Safari on iPhone", userAgent: "Mozilla/5.0 iPhone Version/18.0 Mobile Safari/604.1", platform: "iPhone", wallet: "Apple Pay" },
+  { name: "Chrome on macOS", userAgent: "Mozilla/5.0 Macintosh Chrome/130.0 Safari/537.36", platform: "MacIntel", wallet: "Google Pay" },
+  { name: "Chrome on Android", userAgent: "Mozilla/5.0 Android Chrome/130.0 Mobile Safari/537.36", platform: "Linux armv8", wallet: "Google Pay" },
+  { name: "a browser exposing ApplePaySession", applePay: true, wallet: "Apple Pay" },
+]) {
+  test(`${scenario.name} gets a display-only ${scenario.wallet} option without a payment handler`, async () => {
+    const page = browser("new", undefined, savedBuyer, true, scenario);
+    await page.ready();
+    assert.equal(page.element("wallet-label").textContent, scenario.wallet);
+    assert.equal(page.element("wallet-option").disabled, true);
+    assert.equal(page.element("wallet-option").events.click, undefined);
+    assert.equal(page.requests.some((request) => request.path === "/api/orders" || request.path === "/api/direct-charge"), false);
+  });
+}

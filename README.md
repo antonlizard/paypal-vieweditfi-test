@@ -13,7 +13,15 @@ This is a **sandbox-only integration test**. It defaults to a $10.00 USD purchas
 
 Both pages display the shared saved buyer and an expandable activity panel. The returning page shows an empty state until a payment method is available. No simulated funding instrument is displayed.
 
+Both pages also offer **Credit or debit card** through real PayPal Sandbox **Card Fields** and a disabled, **display-only** digital wallet option. Apple Pay is shown when the browser exposes `ApplePaySession`, or for Safari on an Apple device; other browsers show Google Pay. This display choice is a browser/device heuristic, not a wallet eligibility check. No Apple Pay/Google Pay SDK, payment session, order, or capture is started.
+
+Open the card option to render PayPal-hosted name, number, expiry, and CVV fields. Enter sandbox card details and a billing address, then select **Pay by card**. The backend creates an Orders v2 order with `payment_source.card.attributes.verification.method=SCA_WHEN_REQUIRED`; the SDK submits card and billing details directly to PayPal and handles authentication. Only `flow`, page, and the idempotency UUID go from this form to the Worker. After SDK approval, the backend captures that card order. Card payments work on either page without a saved PayPal buyer and never replace the shared PayPal vault/customer IDs.
+
+The Sandbox business account/app must be enabled for **Advanced Credit and Debit Card Payments**. The page checks `CardFields.isEligible()` and displays an availability message instead of fake card inputs when it cannot render. Use the [PayPal sandbox card generator](https://developer.paypal.com/tools/sandbox/card-testing/) for testing, including [3D Secure scenarios](https://developer.paypal.com/v5/expanded/3d-secure/test/). Card Fields are rendered only after opening the card option, so their iframe sizes can be measured in a visible container.
+
 The returning page displays the Order ID as soon as ViewEditFI creates the order. Approving a payment-method change returns to the merchant page without capturing payment. The buyer clicks **Place order with saved method** to capture that approved order, after which its Transaction ID (capture ID) is displayed. These details also appear for payments made directly with the saved method and for recovered payment results.
+
+Order and Transaction IDs also appear for card payments on both pages. Duplicate submissions reuse the same payment operation. Interrupted captures require a status check; an approved card order can be captured using **Complete approved card payment**. Reloads and card return redirects restore that browser's existing card attempt without automatically capturing. An unapproved card order confirmed by a status check can be retried with its original create key when no capture was attempted.
 
 Both pages include expandable **Create order** and **Capture** panels showing the backend's PayPal REST method, URL, safe headers, JSON request body, response HTTP status, and full response body. Errors are shown too. Capture details appear only after a capture is requested; direct saved-method payments identify that no separate capture call was sent and show the payment result in Create order.
 
@@ -99,7 +107,7 @@ Use a sandbox merchant REST app with PayPal vaulting enabled and a separate sand
 
 ### New customer
 
-The SDK loads from `https://www.sandbox.paypal.com/sdk/js` with `components=buttons`, `vault=true`, and `intent=capture`. The server creates an order using:
+The SDK loads from `https://www.sandbox.paypal.com/sdk/js` with `components=buttons,card-fields`, `vault=true`, and `intent=capture`. The PayPal vaulting flow creates an order using:
 
 ```js
 payment_source: {
@@ -129,10 +137,10 @@ response_type=client_token
 claims[]=vault_id:<the saved vault ID>
 ```
 
-The returned scoped token is attached as the **`data-sdk-client-token` script attribute**. The SDK query includes **all four** components:
+The returned scoped token is attached as the **`data-sdk-client-token` script attribute**. The SDK query includes the **four components required for ViewEditFI plus Card Fields**:
 
 ```text
-buttons,funding-eligibility,messages,saved-payment-methods
+buttons,funding-eligibility,messages,saved-payment-methods,card-fields
 ```
 
 `paypal.SavedPaymentMethods({ createOrder, onApprove, onCancel, onError })` renders into the returning page. No `vaultId` is passed to this constructor.

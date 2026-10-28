@@ -27,10 +27,10 @@ function harness() {
   };
   let store;
   function completed(order, id, vaultStatus = mock.vaultStatus) {
-    const newBuyer = order.body.payment_source.paypal.attributes;
+    const newBuyer = order.body.payment_source.paypal?.attributes;
     return {
       id, status: "COMPLETED",
-      payment_source: { paypal: {
+      payment_source: order.body.payment_source.card ? { card: { brand: "VISA", last_digits: "1111" } } : { paypal: {
         email_address: `buyer-${id}@example.test`,
         attributes: { vault: newBuyer ? {
           status: vaultStatus,
@@ -56,7 +56,7 @@ function harness() {
       let order = requestIds.get(requestId);
       if (!order) {
         const id = `ORDER${String(++serial).padStart(5, "0")}`;
-        const direct = Boolean(body.payment_source.paypal.vault_id);
+        const direct = Boolean(body.payment_source.paypal?.vault_id);
         order = { id, body, result: { id, status: "PAYER_ACTION_REQUIRED" } };
         if (direct) {
           mock.charges++;
@@ -107,6 +107,82 @@ function harness() {
   }
   return { call, newCheckout, calls, storage, orders, env, mock, restart };
 }
+
+for (const page of ["new", "returning"]) {
+  test(`Card Fields on the ${page} page use Orders v2 create and capture without a saved buyer`, async () => {
+    const h = harness();
+    const requestId = crypto.randomUUID();
+    const created = await h.call("/api/orders", {
+      flow: "card", page, requestId,
+      // The server must ignore browser-supplied amounts and payment details.
+      purchase_units: [{ amount: { currency_code: "EUR", value: "0.01" } }],
+      payment_source: { card: { number: "4111111111111111", security_code: "123" } },
+    });
+    assert.equal(created.status, 200);
+    const request = h.calls.find((call) => call.path === "/v2/checkout/orders");
+    assert.deepEqual(request.body.purchase_units, [{ amount: { currency_code: "USD", value: "10.00" } }]);
+    assert.equal(request.body.payment_source.paypal, undefined);
+    assert.deepEqual(request.body.payment_source.card.attributes, { verification: { method: "SCA_WHEN_REQUIRED" } });
+    assert.equal(request.body.payment_source.card.number, undefined);
+    assert.equal(request.body.payment_source.card.security_code, undefined);
+    assert.equal(request.body.payment_source.card.attributes.vault, undefined);
+    assert.equal(request.body.payment_source.card.experience_context.return_url, `https://test.example/${page === "new" ? "new" : "returning"}-customer?card=return`);
+    h.restart();
+    const captured = await h.call(`/api/orders/${created.body.order.id}/capture`, {});
+    assert.equal(captured.status, 200);
+    assert.equal(captured.body.order.completed, true);
+    assert.equal(captured.body.flow, "card");
+    assert.ok(captured.body.order.purchase_units[0].payments.captures[0].id);
+    assert.equal((await h.call("/api/state")).body.buyer, null);
+    assert.equal(h.storage.map.has("sequence"), false);
+    assert.equal(JSON.stringify([...h.storage.map]).includes("4111111111111111"), false);
+  });
+}
+
+test("card payments preserve the saved buyer even when another PayPal checkout replaces it before capture", async () => {
+  const h = harness();
+  await h.newCheckout();
+  const created = await h.call("/api/orders", { flow: "card", page: "returning", requestId: crypto.randomUUID() });
+  await h.newCheckout();
+  const latest = (await h.call("/api/state")).body.buyer;
+  const captured = await h.call(`/api/orders/${created.body.order.id}/capture`, {});
+  assert.equal(captured.status, 200);
+  assert.equal(captured.body.order.completed, true);
+  assert.deepEqual((await h.call("/api/state")).body.buyer, latest);
+  assert.equal(h.storage.map.get(`operation:${h.calls.find((call) => call.body?.payment_source?.card).headers["PayPal-Request-Id"].slice(7)}`).flow, "card");
+});
+
+test("card create retries and duplicate captures preserve their payment idempotency keys", async () => {
+  const h = harness();
+  const input = { flow: "card", page: "new", requestId: crypto.randomUUID() };
+  h.mock.loseCreateResponse = true;
+  assert.equal((await h.call("/api/orders", input)).status, 502);
+  h.restart();
+  const created = await h.call("/api/orders", input);
+  assert.equal(created.status, 200);
+  const orderId = created.body.order.id;
+  const creates = h.calls.filter((call) => call.path === "/v2/checkout/orders");
+  assert.equal(creates.length, 2);
+  assert.deepEqual(creates[0].body, creates[1].body);
+  assert.equal(creates[0].headers["PayPal-Request-Id"], creates[1].headers["PayPal-Request-Id"]);
+  const results = await Promise.all([h.call(`/api/orders/${orderId}/capture`, {}), h.call(`/api/orders/${orderId}/capture`, {})]);
+  assert.ok(results.every((result) => result.body.order.completed));
+  assert.equal(h.calls.filter((call) => call.path.endsWith("/capture")).length, 1);
+  assert.equal((await h.call("/api/orders", { ...input, flow: "new" })).body.error, "IDEMPOTENCY_CONFLICT");
+  assert.equal((await h.call("/api/orders", { ...input, page: "returning" })).body.error, "IDEMPOTENCY_CONFLICT");
+});
+
+test("a declined card capture returns diagnostics and preserves the cached PayPal buyer", async () => {
+  const h = harness();
+  await h.newCheckout();
+  const buyer = (await h.call("/api/state")).body.buyer;
+  const created = await h.call("/api/orders", { flow: "card", requestId: crypto.randomUUID() });
+  h.mock.failCapture = true;
+  const captured = await h.call(`/api/orders/${created.body.order.id}/capture`, {});
+  assert.equal(captured.status, 502);
+  assert.equal(captured.body.details.traces.capture.response.status, 422);
+  assert.deepEqual((await h.call("/api/state")).body.buyer, buyer);
+});
 
 test("basic authentication protects pages, assets, and APIs, including failures", async () => {
   const h = harness();

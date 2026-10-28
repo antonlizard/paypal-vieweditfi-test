@@ -1,10 +1,11 @@
 const $ = (id) => document.getElementById(id);
 const flow = document.body.dataset.flow;
 let settings, buyer, mounted = false, busy = false, paid = false, unresolved = false, lastOrderId, approvedOrderId, submittingPayment = false;
+let cardFields, cardMounted = false, cardRendering, cardSubmitting = false, cardOrderId, approvedCardOrderId, cardCapturePromise, activeMethod = "paypal";
 const activity = [];
 const displayedAuthorizations = new Map();
 const context = () => flow === "new" ? "new" : `returning:${buyer?.revision}`;
-const storageKey = (kind) => `editfi:${context()}:${kind}`;
+const storageKey = (kind) => `editfi:${kind === "card" ? flow : context()}:${kind}`;
 const placeOrderPrompt = 'Payment method approved. Click "Place order with saved method" to complete the purchase.';
 
 function log(event, data) {
@@ -55,13 +56,22 @@ function showApiTraces(traces) {
 }
 
 function controls() {
-  const locked = busy || paid || unresolved;
+  const locked = busy || paid || unresolved || cardSubmitting;
   const container = $("checkout-controls");
   container.inert = locked;
   if ($("place-order")) $("place-order").disabled = locked || !mounted;
+  // Keep hosted fields interactive during their own submission so a 3DS
+  // authentication challenge inside a PayPal iframe remains usable.
+  $("alternative-controls").inert = locked && !cardSubmitting;
+  $("card-submit").disabled = locked || !cardMounted;
+  $("resume-card").hidden = paid || !approvedCardOrderId;
+  $("resume-card").disabled = busy || submittingPayment || cardSubmitting;
   $("check-status").hidden = !unresolved;
   $("success-actions").hidden = !paid;
-  if (paid) container.hidden = true;
+  if (paid) {
+    container.hidden = true;
+    $("alternative-controls").hidden = true;
+  }
 }
 
 function showError(error) {
@@ -120,7 +130,6 @@ function showBuyer(value) {
 }
 
 function showPaymentDetails(order) {
-  if (flow !== "returning") return;
   $("payment-details").hidden = !order?.id;
   $("payment-order-id").textContent = order?.id || "—";
   const captureIds = (order?.purchase_units || []).flatMap((unit) =>
@@ -143,7 +152,7 @@ async function finish(result) {
   const current = await api("/api/state");
   showBuyer(current.buyer);
   if (paid) {
-    status(`Payment completed. Order ${order.id}.${flow === "new" && current.buyer?.state !== "VAULTED" ? " Vaulting is pending; refresh the saved buyer before using the returning flow." : ""}`, "success");
+    status(`${activeMethod === "card" ? "Card payment" : "Payment"} completed. Order ${order.id}.${activeMethod !== "card" && flow === "new" && current.buyer?.state !== "VAULTED" ? " Vaulting is pending; refresh the saved buyer before using the returning flow." : ""}`, "success");
   } else {
     status(`Order ${order.id}: ${order.status}. Payment is not confirmed. Check its status before starting another purchase.`);
   }
@@ -174,6 +183,9 @@ async function createOrder() {
     approvedOrderId = undefined;
   }
   busy = true;
+  activeMethod = "paypal";
+  sessionStorage.removeItem(storageKey("card"));
+  cardOrderId = approvedCardOrderId = undefined;
   lastOrderId = undefined;
   showPaymentDetails(null);
   resetApiTraces();
@@ -197,6 +209,7 @@ async function createOrder() {
 }
 
 async function onApprove(data) {
+  if (cardSubmitting || activeMethod === "card") return;
   if (flow === "returning") {
     if (paid || unresolved || submittingPayment) return;
     awaitPlacement({ id: data.orderID });
@@ -206,6 +219,7 @@ async function onApprove(data) {
 }
 
 async function captureOrder(orderID) {
+  if (activeMethod === "card") approvedCardOrderId = undefined;
   busy = true;
   submittingPayment = true;
   controls();
@@ -239,7 +253,8 @@ function onCancel() {
 
 function loadSDK(clientToken) {
   return new Promise((resolve, reject) => {
-    const components = flow === "new" ? "buttons" : "buttons,funding-eligibility,messages,saved-payment-methods";
+    const components = flow === "returning" && buyer?.state === "VAULTED" ?
+      "buttons,funding-eligibility,messages,saved-payment-methods,card-fields" : "buttons,card-fields";
     const parameters = new URLSearchParams({
       "client-id": settings.clientId, components, vault: "true", commit: flow === "returning" ? "false" : "true",
       intent: "capture", currency: settings.currency,
@@ -256,12 +271,16 @@ function loadSDK(clientToken) {
 }
 
 async function recoverAttempt() {
-  for (const kind of ["direct", "component"]) {
+  for (const kind of ["card", "direct", "component"]) {
     const key = sessionStorage.getItem(storageKey(kind));
     if (!key) continue;
     const previous = await api(`/api/operations/${encodeURIComponent(key)}`);
     if (!previous.order?.id) continue;
     const result = await api(`/api/orders/${encodeURIComponent(previous.order.id)}`);
+    if (kind === "card") {
+      await restoreCard(result);
+      return true;
+    }
     if (result.order.completed || kind === "direct" || hasCapture(result.order)) {
       await finish(result);
       return true;
@@ -275,6 +294,7 @@ async function recoverAttempt() {
 }
 
 async function start() {
+  configureWalletPlaceholder();
   const [configuration, cached] = await Promise.all([api("/api/config"), api("/api/state")]);
   settings = configuration;
   buyer = cached.buyer;
@@ -284,6 +304,13 @@ async function start() {
   });
   log("Configuration loaded", { environment: settings.environment, amount: settings.amount, currency: settings.currency });
   const query = new URLSearchParams(location.search);
+  if (query.get("card")) {
+    history.replaceState(null, "", location.pathname);
+    // Restore only an order belonging to this browser's card attempt. Redirects
+    // and reloads check status; they never submit a fresh payment or capture.
+    await recoverAttempt();
+    if (paid) return;
+  }
   if (query.get("paypal") === "cancel") onCancel();
   if (query.get("paypal") === "return" && query.get("token")) {
     history.replaceState(null, "", location.pathname);
@@ -307,19 +334,24 @@ async function start() {
       $("empty-state").querySelector("p").textContent = "Refresh the saved buyer once PayPal finishes vaulting. The previous buyer will not be used.";
     }
     status(buyer ? "Waiting for a vaulted token from PayPal." : "Create a saved buyer in Flow 01 to continue.");
-    return;
   }
-  if (!approvedOrderId && await recoverAttempt()) return;
+  if (!approvedOrderId && !cardOrderId) await recoverAttempt();
+  if (paid) return;
   let token;
-  if (flow === "returning") {
-    token = await api("/api/client-token", { vaultRevision: buyer.revision });
-    log("Vault-scoped SDK client token issued", { expiresIn: token.expiresIn });
+  if (flow === "returning" && buyer?.state === "VAULTED") {
+    try {
+      token = await api("/api/client-token", { vaultRevision: buyer.revision });
+      log("Vault-scoped SDK client token issued", { expiresIn: token.expiresIn });
+    } catch (error) {
+      showError(error);
+    }
   }
   const paypal = await loadSDK(token?.clientToken);
+  initializeCardFields(paypal);
   const callbacks = { createOrder, onApprove, onCancel, onError: showError };
   if (flow === "new") {
     await paypal.Buttons({ ...callbacks, fundingSource: paypal.FUNDING.PAYPAL, style: { layout: "vertical", shape: "rect", label: "paypal", height: 48 } }).render("#paypal-button-container");
-  } else {
+  } else if (token) {
     if (typeof paypal.SavedPaymentMethods !== "function") {
       throw new Error("This sandbox SDK did not expose SavedPaymentMethods. Confirm that saved-payment-methods / ViewEditFI is enabled for this PayPal REST app and environment.");
     }
@@ -328,11 +360,142 @@ async function start() {
     // from the SDK script's data-sdk-client-token attribute above.
     await paypal.SavedPaymentMethods(callbacks).render("#saved-payment-methods-container");
   }
-  mounted = true;
+  mounted = flow === "new" || Boolean(token);
   controls();
-  status(approvedOrderId ? placeOrderPrompt : flow === "new" ? "Ready. Use a sandbox buyer account to pay and save." : "Ready. Review or edit the saved method, or place the order below.");
-  log(flow === "new" ? "PayPal Buttons rendered" : "SavedPaymentMethods rendered");
+  if (!unresolved && !cardOrderId) status(approvedOrderId ? placeOrderPrompt : flow === "new" ? "Ready. Use PayPal to pay and save, or choose a card payment." : mounted ? "Ready. Review or edit the saved method, or choose a card payment." : "No saved PayPal method is ready. You can pay by card below.");
+  if (mounted) log(flow === "new" ? "PayPal Buttons rendered" : "SavedPaymentMethods rendered");
 }
+
+function configureWalletPlaceholder() {
+  const agent = navigator.userAgent || "";
+  const appleDevice = /Mac|iPhone|iPad|iPod/i.test(`${navigator.platform || ""} ${agent}`);
+  const safari = /Safari/i.test(agent) && !/Chrome|Chromium|CriOS|Edg|OPR|FxiOS|Android/i.test(agent);
+  const wallet = typeof window.ApplePaySession !== "undefined" || (appleDevice && safari) ? "Apple Pay" : "Google Pay";
+  $("wallet-label").textContent = wallet;
+  $("wallet-option").disabled = true;
+  $("wallet-note").textContent = `${wallet} is a display-only option. No wallet payment will be started.`;
+}
+
+function cardError(error) {
+  if (paid) return;
+  busy = false;
+  unresolved = Boolean(cardOrderId) && !paid;
+  // SDK error objects can contain field-level data. Never log or persist them.
+  const safe = error?.code && error.details?.traces ? error : new Error(
+    cardOrderId ? "Card submission was interrupted. Check payment status before trying again." :
+      "Card payment could not be submitted. Review the card and billing fields, then retry.",
+  );
+  showError(safe);
+}
+
+async function createCardOrder() {
+  if (!cardSubmitting || paid || unresolved) throw new Error("Submit the card form to start this payment.");
+  const result = await api("/api/orders", { flow: "card", page: flow, requestId: requestId("card") });
+  cardOrderId = lastOrderId = result.order.id;
+  showPaymentDetails(result.order);
+  log("Card order created", { orderID: cardOrderId });
+  return cardOrderId;
+}
+
+function initializeCardFields(paypal) {
+  try {
+    if (typeof paypal.CardFields !== "function") throw new Error("Card Fields is not available in this SDK.");
+    cardFields = paypal.CardFields({
+      createOrder: createCardOrder,
+      onApprove(data) {
+        if (paid || unresolved) return;
+        if (!cardSubmitting || data.orderID !== cardOrderId) throw new Error("Unexpected card order approval.");
+        if (!cardCapturePromise) {
+          approvedCardOrderId = data.orderID;
+          cardCapturePromise = captureOrder(data.orderID).finally(() => { cardCapturePromise = undefined; });
+        }
+        return cardCapturePromise;
+      },
+      onError: cardError,
+      style: { input: { "font-family": "Arial, sans-serif", "font-size": "15px", color: "#152544", padding: "12px" }, ".invalid": { color: "#a64237" } },
+    });
+    if (!cardFields.isEligible()) throw new Error("This Sandbox REST app is not eligible for Card Fields.");
+    $("card-status").textContent = "Pay securely with a sandbox credit or debit card.";
+    $("card-form").hidden = false;
+    const render = () => {
+      if (!$("card-option").open || cardRendering) return cardRendering;
+      cardRendering = Promise.resolve().then(() => Promise.all([
+        cardFields.NameField({ ariaLabel: "Cardholder name" }).render("#card-name-field"),
+        cardFields.NumberField({ ariaLabel: "Card number" }).render("#card-number-field"),
+        cardFields.ExpiryField({ ariaLabel: "Expiry date" }).render("#card-expiry-field"),
+        cardFields.CVVField({ ariaLabel: "Security code" }).render("#card-cvv-field"),
+      ])).then(() => { cardMounted = true; controls(); }).catch(() => {
+        $("card-status").textContent = "Secure card fields could not load. Reload this page to retry.";
+        $("card-form").hidden = true;
+      });
+      return cardRendering;
+    };
+    $("card-option").addEventListener("toggle", render);
+    render();
+  } catch {
+    $("card-status").textContent = "Credit and debit card checkout is unavailable. Enable Advanced Credit and Debit Card Payments for this PayPal Sandbox business account and app, then reload.";
+    $("card-form").hidden = true;
+  }
+}
+
+async function restoreCard(result) {
+  activeMethod = "card";
+  cardOrderId = lastOrderId = result.order.id;
+  if (result.order.completed || hasCapture(result.order)) return finish(result);
+  busy = false;
+  showPaymentDetails(result.order);
+  approvedCardOrderId = result.order.status === "APPROVED" ? result.order.id : undefined;
+  // A confirmed unapproved order can be retried with the SAME create key. A
+  // previous capture attempt always keeps the checkout locked for recovery.
+  const retryable = ["CREATED", "PAYER_ACTION_REQUIRED"].includes(result.order.status) && !result.traces?.capture?.attempted;
+  unresolved = !retryable;
+  status(approvedCardOrderId ? "Card payment approved. Click Complete approved card payment to capture this order." :
+    retryable ? "Card payment is not approved. Review the card details and retry the same checkout." : "Card payment is not confirmed. Check its status before another purchase.");
+  controls();
+}
+
+$("card-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (busy || paid || unresolved || submittingPayment || cardSubmitting || !cardMounted) return;
+  busy = submittingPayment = cardSubmitting = true;
+  controls();
+  try {
+    const state = await cardFields.getState();
+    if (!state.isFormValid) {
+      status("Check the card number, expiry date, and security code.", "error");
+      return;
+    }
+    activeMethod = "card";
+    approvedOrderId = approvedCardOrderId = cardOrderId = lastOrderId = undefined;
+    sessionStorage.removeItem(storageKey("component"));
+    sessionStorage.removeItem(storageKey("direct"));
+    showPaymentDetails(null);
+    resetApiTraces();
+    status("Submitting the card payment to PayPal Sandbox…");
+    // Billing details and hosted card fields go directly to PayPal through the
+    // SDK. Our Worker receives only flow/page and the idempotency request ID.
+    await cardFields.submit({ billingAddress: {
+      addressLine1: $("billing-line1").value.trim(), addressLine2: $("billing-line2").value.trim(),
+      adminArea1: $("billing-region").value.trim(), adminArea2: $("billing-city").value.trim(),
+      postalCode: $("billing-postal").value.trim(), countryCode: $("billing-country").value.trim().toUpperCase(),
+    } });
+    if (!paid && !unresolved && cardOrderId) {
+      unresolved = true;
+      status("Card payment is awaiting confirmation. Check payment status before retrying.");
+    }
+  } catch (error) { if (!paid) cardError(error); }
+  finally {
+    busy = submittingPayment = cardSubmitting = false;
+    controls();
+  }
+});
+
+$("resume-card").addEventListener("click", async () => {
+  if (!approvedCardOrderId || busy || paid || submittingPayment || cardSubmitting) return;
+  activeMethod = "card";
+  await captureOrder(approvedCardOrderId).catch(() => {});
+  controls();
+});
 
 $("place-order")?.addEventListener("click", async () => {
   if (busy || paid || unresolved || submittingPayment || !mounted) return;
@@ -343,6 +506,9 @@ $("place-order")?.addEventListener("click", async () => {
     return;
   }
   busy = true;
+  activeMethod = "paypal";
+  sessionStorage.removeItem(storageKey("card"));
+  cardOrderId = approvedCardOrderId = undefined;
   submittingPayment = true;
   lastOrderId = undefined;
   showPaymentDetails(null);
@@ -368,7 +534,9 @@ $("check-status").addEventListener("click", async () => {
   try {
     if (lastOrderId) {
       const result = await api(`/api/orders/${encodeURIComponent(lastOrderId)}`);
-      if (approvedOrderId === lastOrderId && result.order.status === "APPROVED" && !hasCapture(result.order)) {
+      if (activeMethod === "card") {
+        await restoreCard(result);
+      } else if (approvedOrderId === lastOrderId && result.order.status === "APPROVED" && !hasCapture(result.order)) {
         awaitPlacement(result.order);
       } else {
         await finish(result);
@@ -393,7 +561,7 @@ $("refresh-vault").addEventListener("click", async () => {
 });
 
 $("another-checkout").addEventListener("click", () => {
-  for (const kind of ["direct", "component"]) sessionStorage.removeItem(storageKey(kind));
+  for (const kind of ["card", "direct", "component"]) sessionStorage.removeItem(storageKey(kind));
   location.href = location.pathname;
 });
 

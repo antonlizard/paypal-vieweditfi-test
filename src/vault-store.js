@@ -86,7 +86,7 @@ export class VaultStore {
     const operationMatch = path.match(/^\/api\/operations\/([0-9a-f-]+)$/i);
     if (method === "GET" && operationMatch && UUID.test(operationMatch[1])) {
       const operation = await this.storage.get(`operation:${operationMatch[1]}`);
-      return json({ order: operation?.result || null, traces: operation?.traces || {} });
+      return json({ order: operation?.result || null, flow: operation?.flow, traces: operation?.traces || {} });
     }
     const orderMatch = path.match(/^\/api\/orders\/([A-Z0-9]+)(\/capture)?$/i);
     if (orderMatch && ORDER_ID.test(orderMatch[1])) {
@@ -114,10 +114,13 @@ export class VaultStore {
       throw new AppError(400, "INVALID_REQUEST_ID", "A UUID requestId is required for payment idempotency.");
     }
     const flow = direct ? "direct" : input.flow;
-    if (!["new", "returning", "direct"].includes(flow)) throw new AppError(400, "INVALID_FLOW", "Choose the new or returning flow.");
+    if (!["new", "returning", "direct", "card"].includes(flow)) throw new AppError(400, "INVALID_FLOW", "Choose the new, returning, or card flow.");
+    const checkoutPage = flow === "card" ? input.page || "new" : flow === "new" ? "new" : "returning";
+    if (!["new", "returning"].includes(checkoutPage)) throw new AppError(400, "INVALID_PAGE", "Choose a checkout page.");
     const key = `operation:${input.requestId}`;
     let operation = await this.storage.get(key);
-    if (operation && (operation.flow !== flow || operation.vaultRevision !== input.vaultRevision)) {
+    if (operation && (operation.flow !== flow || operation.vaultRevision !== input.vaultRevision ||
+        (flow === "card" && operation.checkoutPage !== checkoutPage))) {
       throw new AppError(409, "IDEMPOTENCY_CONFLICT", "This requestId already belongs to a different checkout.");
     }
     // Return an existing result before checking the active buyer, so retries
@@ -128,14 +131,15 @@ export class VaultStore {
       // must not be blindly submitted again after that protection might expire.
       throw new AppError(409, "PAYMENT_OUTCOME_UNKNOWN", "This interrupted checkout is too old to retry safely. Check its outcome in the PayPal sandbox dashboard before starting another purchase.");
     }
-    const buyer = flow === "new" ? null : await this.current(input.vaultRevision);
+    const buyer = ["returning", "direct"].includes(flow) ? await this.current(input.vaultRevision) : null;
     if (!operation) {
       const settings = config(this.env);
       const origin = new URL(request.url).origin;
-      const page = flow === "new" ? "new-customer" : "returning-customer";
+      const page = checkoutPage === "new" ? "new-customer" : "returning-customer";
+      const returnParameter = flow === "card" ? "card" : "paypal";
       const experience = {
-        return_url: `${origin}/${page}?paypal=return`,
-        cancel_url: `${origin}/${page}?paypal=cancel`,
+        return_url: `${origin}/${page}?${returnParameter}=return`,
+        cancel_url: `${origin}/${page}?${returnParameter}=cancel`,
         shipping_preference: "NO_SHIPPING",
         user_action: flow === "returning" ? "CONTINUE" : "PAY_NOW",
       };
@@ -161,12 +165,22 @@ export class VaultStore {
           ...experience,
           preferred_payment_source: { vault_id: buyer.vaultId },
         } };
+      } else if (flow === "card") {
+        // The SDK sends card details directly to PayPal. The Worker supplies
+        // only checkout settings and the 3DS preference, and never vaults cards.
+        source = {
+          attributes: { verification: { method: "SCA_WHEN_REQUIRED" } },
+          experience_context: {
+            return_url: experience.return_url, cancel_url: experience.cancel_url, shipping_preference: "NO_SHIPPING",
+          },
+        };
       } else {
         source = { vault_id: buyer.vaultId };
       }
       operation = {
         requestId: input.requestId,
         flow,
+        checkoutPage,
         vaultRevision: input.vaultRevision,
         sequence,
         merchantCustomerId,
@@ -174,7 +188,7 @@ export class VaultStore {
         payload: {
           intent: "CAPTURE",
           purchase_units: [{ amount: { currency_code: settings.currency, value: settings.amount } }],
-          payment_source: { paypal: source },
+          payment_source: { [flow === "card" ? "card" : "paypal"]: source },
         },
       };
       // Persist the exact payload before sending money-related requests. If a
@@ -220,7 +234,7 @@ export class VaultStore {
     const operation = operationKey ? await this.storage.get(operationKey) : null;
     if (!operation) throw new AppError(404, "UNKNOWN_ORDER", "This order was not created by this test application.");
     if (capture && operation.result?.completed) return json({ order: operation.result, traces: operation.traces || {}, replayed: true });
-    if (capture && operation.flow !== "new") await this.current(operation.vaultRevision);
+    if (capture && ["returning", "direct"].includes(operation.flow)) await this.current(operation.vaultRevision);
     if (capture && operation.flow === "direct") {
       throw new AppError(409, "DIRECT_ORDER", "Direct charges are processed by create order. Check their status instead of capturing again.");
     }
@@ -233,6 +247,7 @@ export class VaultStore {
     await this.finish(operation, order);
     return json({
       order: operation.result,
+      flow: operation.flow,
       traces: { ...operation.traces, ...(captured ? { capture: captured.trace } : {}) },
       buyer: publicBuyer(await this.storage.get("current")),
     });

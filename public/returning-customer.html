@@ -22,6 +22,28 @@
           <div class="total"><span>Total</span><strong data-amount>—</strong></div>
           <div id="empty-state" class="empty-state" hidden><span class="empty-icon" aria-hidden="true">◇</span><h3>No saved buyer yet</h3><p>Complete the new-customer flow to create a saved payment method.</p><a class="button primary" href="/new-customer">Start a new-customer checkout →</a></div>
           <div id="checkout-controls" hidden><p class="payment-label">Your saved payment method</p><div id="saved-payment-methods-container" class="sdk-container saved-method"></div><p class="component-note">Edit and approve the payment method in PayPal, then place your order below.</p><button id="place-order" class="button primary" disabled>Place order with saved method</button><p class="component-note">Payment is captured only when you click this button.</p></div>
+          <div id="alternative-controls" class="alternative-payments">
+            <p class="payment-label">Other payment methods</p>
+            <details id="card-option" class="payment-option">
+              <summary><span>Credit or debit card</span><span class="method-badge">Sandbox</span></summary>
+              <p id="card-status" class="supporting" role="status">Loading secure card fields…</p>
+              <form id="card-form" hidden>
+                <p class="field-label">Cardholder name</p><div id="card-name-field" class="card-field"></div>
+                <p class="field-label">Card number</p><div id="card-number-field" class="card-field"></div>
+                <div class="card-field-row"><div><p class="field-label">Expiry date</p><div id="card-expiry-field" class="card-field"></div></div><div><p class="field-label">Security code</p><div id="card-cvv-field" class="card-field"></div></div></div>
+                <fieldset class="billing-fields"><legend>Billing address</legend>
+                  <label>Address line 1<input id="billing-line1" autocomplete="billing address-line1" required maxlength="300"></label>
+                  <label>Address line 2 (optional)<input id="billing-line2" autocomplete="billing address-line2" maxlength="300"></label>
+                  <div class="card-field-row"><label>City<input id="billing-city" autocomplete="billing address-level2" required maxlength="120"></label><label>Postal code<input id="billing-postal" autocomplete="billing postal-code" required maxlength="60"></label></div>
+                  <div class="card-field-row"><label>State / region (optional)<input id="billing-region" autocomplete="billing address-level1" maxlength="120"></label><label>Country code<input id="billing-country" autocomplete="billing country" value="DE" required pattern="[A-Za-z]{2}" maxlength="2" title="Two-letter country code, for example DE or US"></label></div>
+                </fieldset>
+                <button id="card-submit" class="button primary" type="submit" disabled>Pay by card <span data-amount>—</span></button>
+                <p class="component-note">PayPal securely collects your card details. This card payment does not change the saved PayPal buyer.</p>
+              </form>
+            </details>
+            <button id="wallet-option" class="button wallet-placeholder" type="button" disabled aria-describedby="wallet-note"><span id="wallet-label">Digital wallet</span><span class="method-badge">Display only</span></button>
+            <p id="wallet-note" class="component-note">Wallet checkout is not connected in this test.</p>
+          </div>
           <div id="status" class="status" role="status" aria-live="polite">Loading saved buyer…</div>
           <section id="payment-details" class="payment-details" aria-labelledby="payment-details-title" aria-live="polite" hidden>
             <h3 id="payment-details-title">Payment details</h3>
@@ -31,6 +53,7 @@
             </dl>
           </section>
           <button id="check-status" class="button secondary" hidden>Check payment status</button>
+          <button id="resume-card" class="button secondary" hidden>Complete approved card payment</button>
           <div id="success-actions" hidden><button id="another-checkout" class="button primary">Start another returning-customer purchase →</button><a class="text-button" href="/new-customer">Test with a different buyer</a></div>
           <p class="fine-print">This page uses the latest saved vault ID from the new-customer checkout.</p>
         </section>
