@@ -3,6 +3,7 @@ const flow = document.body.dataset.flow;
 let settings, buyer, mounted = false, busy = false, paid = false, unresolved = false, lastOrderId, approvedOrderId, submittingPayment = false;
 let cardFields, cardMounted = false, cardRendering, cardSubmitting = false, cardOrderId, approvedCardOrderId, cardCapturePromise, activeMethod = "paypal";
 let savePayPalChoice = false, saveCardChoice = false, savedCardAuthenticationUrl;
+let selectedMethod, renderNewPayPalButton, renderCardFields;
 const activity = [];
 const displayedAuthorizations = new Map();
 const context = () => flow === "new" ? "new" : `returning:${buyer?.revision}`;
@@ -61,6 +62,10 @@ function showApiTraces(traces) {
 
 function controls() {
   const locked = busy || paid || unresolved || cardSubmitting;
+  if (flow === "new") {
+    $("payment-methods").disabled = locked;
+    $("payment-methods").hidden = paid;
+  }
   const container = $("checkout-controls");
   container.inert = locked;
   if ($("place-order")) $("place-order").disabled = locked || !mounted;
@@ -187,6 +192,7 @@ function awaitPlacement(order) {
 }
 
 async function createOrder() {
+  if (flow === "new" && selectedMethod !== "paypal") throw new Error("Select PayPal to start this payment.");
   if (paid || unresolved || submittingPayment) throw new Error("This checkout already submitted a payment. Start a new purchase after checking its result.");
   if (flow === "returning" && approvedOrderId) {
     // A further edit gets a fresh order. The previous approved order remains
@@ -224,6 +230,7 @@ async function createOrder() {
 
 async function onApprove(data) {
   if (cardSubmitting || activeMethod !== "paypal") return;
+  if (flow === "new" && selectedMethod !== "paypal") return;
   if (savedPayPal()) {
     if (paid || unresolved || submittingPayment) return;
     awaitPlacement({ id: data.orderID });
@@ -299,6 +306,7 @@ async function recoverAttempt() {
       saveCardChoice = $("save-card").checked = previous.savePaymentMethod;
     }
     if (!previous.order?.id) continue;
+    if (flow === "new") await selectPaymentMethod(kind === "card" ? "card" : "paypal");
     const result = await api(`/api/orders/${encodeURIComponent(previous.order.id)}`);
     if (["card", "saved-card"].includes(kind)) {
       await restoreCard(result, kind);
@@ -317,6 +325,7 @@ async function recoverAttempt() {
 }
 
 async function start() {
+  if (flow === "new") await selectPaymentMethod(undefined);
   configureWalletPlaceholder();
   const [configuration, cached] = await Promise.all([api("/api/config"), api("/api/state")]);
   settings = configuration;
@@ -338,6 +347,7 @@ async function start() {
   if (query.get("paypal") === "return" && query.get("token")) {
     history.replaceState(null, "", location.pathname);
     if (flow === "new") {
+      await selectPaymentMethod("paypal");
       await onApprove({ orderID: query.get("token") });
       return;
     }
@@ -373,7 +383,10 @@ async function start() {
   initializeCardFields(paypal);
   const callbacks = { createOrder, onApprove, onCancel, onError: showError };
   if (flow === "new") {
-    await paypal.Buttons({ ...callbacks, fundingSource: paypal.FUNDING.PAYPAL, style: { layout: "vertical", shape: "rect", label: "paypal", height: 48 } }).render("#paypal-button-container");
+    let rendering;
+    renderNewPayPalButton = () => rendering ||= Promise.resolve().then(() =>
+      paypal.Buttons({ ...callbacks, fundingSource: paypal.FUNDING.PAYPAL, style: { layout: "vertical", shape: "rect", label: "paypal", height: 48 } }).render("#paypal-button-container"));
+    if (selectedMethod === "paypal") await renderNewPayPalButton();
   } else if (token) {
     if (typeof paypal.SavedPaymentMethods !== "function") {
       throw new Error("This sandbox SDK did not expose SavedPaymentMethods. Confirm that saved-payment-methods / ViewEditFI is enabled for this PayPal REST app and environment.");
@@ -398,16 +411,44 @@ async function start() {
   }
   mounted = flow === "new" || Boolean(token) || (savedCard() && buyer.state === "VAULTED");
   controls();
-  if (!unresolved && !cardOrderId) status(approvedOrderId ? placeOrderPrompt : flow === "new" ? "Ready. Use PayPal to pay and save, or choose a card payment." : mounted ? "Ready. Review or edit the saved method, or choose a card payment." : "No saved PayPal method is ready. You can pay by card below.");
-  if (mounted) log(flow === "new" ? "PayPal Buttons rendered" : "SavedPaymentMethods rendered");
+  if (!unresolved && !cardOrderId) status(approvedOrderId ? placeOrderPrompt : flow === "new" ? "Ready. Select a payment method to continue." : mounted ? "Ready. Review or edit the saved method, or choose a card payment." : "No saved PayPal method is ready. You can pay by card below.");
+  if (mounted) log(flow === "new" ? "Payment method choices ready" : "SavedPaymentMethods rendered");
+}
+
+async function selectPaymentMethod(method) {
+  if (flow !== "new") return;
+  selectedMethod = method;
+  for (const value of ["paypal", "card", "wallet"]) $(`method-${value}`).checked = value === method;
+  $("checkout-controls").hidden = method !== "paypal";
+  $("alternative-controls").hidden = !["card", "wallet"].includes(method);
+  $("card-option").hidden = method !== "card";
+  $("wallet-panel").hidden = method !== "wallet";
+  if (method === "paypal") await renderNewPayPalButton?.();
+  if (method === "card") await renderCardFields?.();
+}
+
+if (flow === "new") {
+  for (const method of ["paypal", "card", "wallet"]) {
+    $(`method-${method}`).addEventListener("change", async () => {
+      if (busy || paid || unresolved || submittingPayment || cardSubmitting) {
+        // Restore the selected radio if a late event arrives during payment.
+        for (const value of ["paypal", "card", "wallet"]) $(`method-${value}`).checked = value === selectedMethod;
+        return;
+      }
+      if ($(`method-${method}`).checked) await selectPaymentMethod(method).catch(showError);
+    });
+  }
 }
 
 function configureWalletPlaceholder() {
   const agent = navigator.userAgent || "";
   const appleDevice = /Mac|iPhone|iPad|iPod/i.test(`${navigator.platform || ""} ${agent}`);
+  const iosDevice = /iPhone|iPad|iPod/i.test(`${navigator.platform || ""} ${agent}`) ||
+    (/Mac/i.test(navigator.platform || "") && navigator.maxTouchPoints > 1);
   const safari = /Safari/i.test(agent) && !/Chrome|Chromium|CriOS|Edg|OPR|FxiOS|Android/i.test(agent);
-  const wallet = typeof window.ApplePaySession !== "undefined" || (appleDevice && safari) ? "Apple Pay" : "Google Pay";
+  const wallet = typeof window.ApplePaySession !== "undefined" || iosDevice || (appleDevice && safari) ? "Apple Pay" : "Google Pay";
   $("wallet-label").textContent = wallet;
+  if (flow === "new") $("wallet-choice-label").textContent = wallet;
   $("wallet-option").disabled = true;
   $("wallet-note").textContent = `${wallet} is a display-only option. No wallet payment will be started.`;
 }
@@ -454,7 +495,7 @@ function initializeCardFields(paypal) {
     $("card-status").textContent = "Pay securely with a sandbox credit or debit card.";
     $("card-form").hidden = false;
     const render = () => {
-      if (!$("card-option").open || cardRendering) return cardRendering;
+      if ((flow === "new" ? selectedMethod !== "card" : !$("card-option").open) || cardRendering) return cardRendering;
       cardRendering = Promise.resolve().then(() => Promise.all([
         cardFields.NameField({ ariaLabel: "Cardholder name" }).render("#card-name-field"),
         cardFields.NumberField({ ariaLabel: "Card number" }).render("#card-number-field"),
@@ -466,7 +507,8 @@ function initializeCardFields(paypal) {
       });
       return cardRendering;
     };
-    $("card-option").addEventListener("toggle", render);
+    renderCardFields = render;
+    if (flow !== "new") $("card-option").addEventListener("toggle", render);
     render();
   } catch {
     $("card-status").textContent = "Credit and debit card checkout is unavailable. Enable Advanced Credit and Debit Card Payments for this PayPal Sandbox business account and app, then reload.";
@@ -493,6 +535,7 @@ async function restoreCard(result, method = activeMethod.includes("card") ? acti
 
 $("card-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (flow === "new" && selectedMethod !== "card") return;
   if (busy || paid || unresolved || submittingPayment || cardSubmitting || !cardMounted) return;
   busy = submittingPayment = cardSubmitting = true;
   controls();

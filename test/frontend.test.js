@@ -58,10 +58,10 @@ function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, has
       body: { dataset: { flow } }, getElementById: element,
       querySelectorAll: () => [element("amount-1"), element("amount-2")],
       createElement: () => element(`script-${scripts.length}`),
-      head: { appendChild(script) { scripts.push(script); queueMicrotask(() => script.onload()); } },
+      head: { appendChild(script) { scripts.push(script); queueMicrotask(async () => { await options.sdkLoadWait; script.onload(); }); } },
     },
     window: { paypal, ...(options.applePay ? { ApplePaySession: function () {} } : {}) },
-    navigator: { userAgent: options.userAgent || "Chrome/130.0 Safari/537.36", platform: options.platform || "Linux x86_64" },
+    navigator: { userAgent: options.userAgent || "Chrome/130.0 Safari/537.36", platform: options.platform || "Linux x86_64", maxTouchPoints: options.maxTouchPoints || 0 },
     location: { search: options.search || "", pathname: `/${flow === "new" ? "new" : "returning"}-customer`, reload() {}, assign(url) { navigations.push(url); } },
     history: { replaceState() {} },
     sessionStorage: { getItem: (key) => storage.get(key) || null, setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) },
@@ -93,16 +93,23 @@ function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, has
     }
     assert.fail("Frontend did not finish initialization");
   }
+  async function selectMethod(method) {
+    element(`method-${method}`).checked = true;
+    await element(`method-${method}`).events.change();
+  }
   async function openCard() {
-    element("card-option").open = true;
-    await element("card-option").events.toggle?.();
+    if (flow === "new") await selectMethod("card");
+    else {
+      element("card-option").open = true;
+      await element("card-option").events.toggle?.();
+    }
     element("billing-line1").value = "Test street 1";
     element("billing-city").value = "Berlin";
     element("billing-postal").value = "10115";
     element("billing-country").value = "DE";
   }
   const submitCard = () => element("card-form").events.submit({ preventDefault() {} });
-  return { ready, openCard, submitCard, element, scripts, renders, cardRenders, cardSubmissions, requests, navigations, storage, get callbacks() { return callbacks; }, get cardCallbacks() { return cardCallbacks; } };
+  return { ready, selectMethod, openCard, submitCard, element, scripts, renders, cardRenders, cardSubmissions, requests, navigations, storage, get callbacks() { return callbacks; }, get cardCallbacks() { return cardCallbacks; } };
 }
 
 test("new page loads SDK v5 with vaulting, PayPal Buttons and Card Fields", async () => {
@@ -113,13 +120,68 @@ test("new page loads SDK v5 with vaulting, PayPal Buttons and Card Fields", asyn
   assert.equal(sdk.searchParams.get("components"), "buttons,card-fields");
   assert.equal(sdk.searchParams.get("vault"), "true");
   assert.equal(sdk.searchParams.get("commit"), "true");
+  assert.deepEqual(page.renders, []);
+  assert.deepEqual(page.cardRenders, []);
+  for (const method of ["paypal", "card", "wallet"]) assert.equal(page.element(`method-${method}`).checked, false);
+  for (const panel of ["checkout-controls", "alternative-controls", "card-option", "wallet-panel"]) assert.equal(page.element(panel).hidden, true);
+  await page.selectMethod("paypal");
   assert.deepEqual(page.renders, ["#paypal-button-container"]);
   assert.equal(page.requests.some((request) => request.path === "/api/client-token"), false);
   await page.callbacks.createOrder();
   await page.callbacks.onApprove({ orderID: complete.id });
   assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
   assert.match(page.element("status").textContent, /Payment completed/);
+  assert.equal(page.element("payment-methods").hidden, true);
 });
+
+test("new-customer method selection reveals only that method and reuses mounted SDK fields", async () => {
+  const page = browser("new");
+  await page.ready();
+  await page.selectMethod("paypal");
+  page.element("save-paypal").checked = true;
+  assert.equal(page.element("checkout-controls").hidden, false);
+  assert.equal(page.element("alternative-controls").hidden, true);
+  await page.openCard();
+  page.element("save-card").checked = true;
+  assert.equal(page.element("checkout-controls").hidden, true);
+  assert.equal(page.element("card-option").hidden, false);
+  assert.equal(page.element("wallet-panel").hidden, true);
+  assert.equal(page.cardRenders.length, 4);
+  await assert.rejects(page.callbacks.createOrder(), /Select PayPal/);
+  await page.callbacks.onApprove({ orderID: "CANCELLEDORDER" });
+  await page.selectMethod("wallet");
+  assert.equal(page.element("card-option").hidden, true);
+  assert.equal(page.element("wallet-panel").hidden, false);
+  assert.equal(page.element("wallet-option").disabled, true);
+  await page.submitCard();
+  await page.selectMethod("paypal");
+  await page.selectMethod("card");
+  assert.equal(page.element("method-card").checked, true);
+  assert.equal(page.element("method-paypal").checked, false);
+  assert.equal(page.element("method-wallet").checked, false);
+  assert.equal(page.element("save-paypal").checked, true);
+  assert.equal(page.element("save-card").checked, true);
+  assert.equal(page.cardRenders.length, 4);
+  assert.equal(page.renders.length, 1);
+  assert.equal(page.requests.length, 2); // Selection never creates a payment.
+});
+
+for (const method of ["paypal", "card", "wallet"]) {
+  test(`a ${method} selection made while the SDK loads is rendered after it becomes ready`, async () => {
+    let release;
+    const sdkLoadWait = new Promise((resolve) => { release = resolve; });
+    const page = browser("new", undefined, savedBuyer, true, { sdkLoadWait });
+    await page.selectMethod(method);
+    assert.equal(page.renders.length, 0);
+    assert.equal(page.cardRenders.length, 0);
+    release();
+    await page.ready();
+    assert.equal(page.element(`method-${method}`).checked, true);
+    assert.equal(page.renders.length, method === "paypal" ? 1 : 0);
+    assert.equal(page.cardRenders.length, method === "card" ? 4 : 0);
+    assert.equal(page.requests.length, 2);
+  });
+}
 
 test("returning page scopes SDK through its data attribute and all four required components", async () => {
   const page = browser("returning");
@@ -401,12 +463,18 @@ test("a card authentication challenge stays interactive while other payment subm
   const cardConfirmWait = new Promise((resolve) => { release = resolve; });
   const page = browser("new", undefined, savedBuyer, true, { cardConfirmWait });
   await page.ready();
+  await page.selectMethod("paypal");
   await page.openCard();
   const payment = page.submitCard();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(page.element("alternative-controls").inert, false);
   assert.equal(page.element("checkout-controls").inert, true);
   assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("payment-methods").disabled, true);
+  await page.selectMethod("wallet");
+  assert.equal(page.element("method-card").checked, true);
+  assert.equal(page.element("method-wallet").checked, false);
+  assert.equal(page.element("card-option").hidden, false);
   await page.submitCard();
   await page.callbacks.onApprove({ orderID: "OLDPAYPALORDER" });
   assert.equal(page.requests.filter((request) => request.path === "/api/orders").length, 1);
@@ -421,6 +489,7 @@ test("ineligible Card Fields show an actionable message and preserve PayPal chec
   await page.ready();
   assert.equal(page.element("card-form").hidden, true);
   assert.match(page.element("card-status").textContent, /Enable Advanced Credit and Debit Card Payments/);
+  await page.selectMethod("paypal");
   assert.deepEqual(page.renders, ["#paypal-button-container"]);
   await page.callbacks.createOrder();
   await page.callbacks.onApprove({ orderID: complete.id });
@@ -507,6 +576,7 @@ for (const method of ["paypal", "card"]) {
         await page.openCard();
         await page.submitCard();
       } else {
+        await page.selectMethod("paypal");
         await page.callbacks.createOrder();
       }
       const input = page.requests.find((request) => request.path === "/api/orders").body;
@@ -518,6 +588,7 @@ for (const method of ["paypal", "card"]) {
 test("changing PayPal save consent after cancellation starts a new idempotent attempt", async () => {
   const page = browser("new");
   await page.ready();
+  await page.selectMethod("paypal");
   await page.callbacks.createOrder();
   page.callbacks.onCancel();
   page.element("save-paypal").checked = true;
@@ -615,16 +686,26 @@ test("a reloaded card attempt restores its original save consent", async () => {
 for (const scenario of [
   { name: "Safari on macOS", userAgent: "Mozilla/5.0 Macintosh Version/18.0 Safari/605.1.15", platform: "MacIntel", wallet: "Apple Pay" },
   { name: "Safari on iPhone", userAgent: "Mozilla/5.0 iPhone Version/18.0 Mobile Safari/604.1", platform: "iPhone", wallet: "Apple Pay" },
+  { name: "Chrome on iPhone", userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 CriOS/130.0 Mobile/15E148 Safari/604.1", platform: "iPhone", wallet: "Apple Pay" },
+  { name: "Chrome on iPad", userAgent: "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 CriOS/130.0 Mobile/15E148 Safari/604.1", platform: "iPad", wallet: "Apple Pay" },
+  { name: "desktop-mode iPad Chrome", userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) AppleWebKit/605.1.15 CriOS/130.0 Safari/605.1.15", platform: "MacIntel", maxTouchPoints: 5, wallet: "Apple Pay" },
   { name: "Chrome on macOS", userAgent: "Mozilla/5.0 Macintosh Chrome/130.0 Safari/537.36", platform: "MacIntel", wallet: "Google Pay" },
   { name: "Chrome on Android", userAgent: "Mozilla/5.0 Android Chrome/130.0 Mobile Safari/537.36", platform: "Linux armv8", wallet: "Google Pay" },
   { name: "a browser exposing ApplePaySession", applePay: true, wallet: "Apple Pay" },
 ]) {
   test(`${scenario.name} gets a display-only ${scenario.wallet} option without a payment handler`, async () => {
-    const page = browser("new", undefined, savedBuyer, true, scenario);
-    await page.ready();
-    assert.equal(page.element("wallet-label").textContent, scenario.wallet);
-    assert.equal(page.element("wallet-option").disabled, true);
-    assert.equal(page.element("wallet-option").events.click, undefined);
-    assert.equal(page.requests.some((request) => request.path === "/api/orders" || request.path === "/api/direct-charge"), false);
+    for (const flow of ["new", "returning"]) {
+      const page = browser(flow, undefined, savedBuyer, true, scenario);
+      await page.ready();
+      if (flow === "new") {
+        assert.equal(page.element("wallet-choice-label").textContent, scenario.wallet);
+        await page.selectMethod("wallet");
+        assert.equal(page.element("wallet-panel").hidden, false);
+      }
+      assert.equal(page.element("wallet-label").textContent, scenario.wallet);
+      assert.equal(page.element("wallet-option").disabled, true);
+      assert.equal(page.element("wallet-option").events.click, undefined);
+      assert.equal(page.requests.some((request) => request.path === "/api/orders" || request.path === "/api/direct-charge"), false);
+    }
   });
 }

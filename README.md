@@ -8,14 +8,16 @@ This is a **sandbox-only integration test**. It defaults to a $10.00 USD purchas
 
 | Page | Behavior |
 | --- | --- |
-| `/new-customer` | Offers PayPal Buttons and Card Fields. Each has an unchecked **Save payment method for future payments** checkbox. Only an opted-in successful purchase saves its method. |
+| `/new-customer` | Starts with three equal, unselected radio choices: PayPal, Credit or debit card, and Apple Pay / Google Pay. Selecting one reveals only its button or fields. PayPal and card each have an unchecked **Save payment method for future payments** checkbox. Only an opted-in successful purchase saves its method. |
 | `/returning-customer` | Offers the last method saved with a purchase. Saved PayPal uses ViewEditFI; saved cards use a masked card option with 3DS. Other payment options remain available. |
 
 Both pages display the shared saved buyer and an expandable activity panel. The returning page shows an empty state until a payment method is available. No simulated funding instrument is displayed.
 
-Both pages also offer **Credit or debit card** through real PayPal Sandbox **Card Fields** and a disabled, **display-only** digital wallet option. Apple Pay is shown when the browser exposes `ApplePaySession`, or for Safari on an Apple device; other browsers show Google Pay. This display choice is a browser/device heuristic, not a wallet eligibility check. No Apple Pay/Google Pay SDK, payment session, order, or capture is started.
+Both pages also offer **Credit or debit card** through real PayPal Sandbox **Card Fields** and a disabled, **display-only** digital wallet button. Apple Pay is shown on iPhone/iPad browsers including Chrome, on Safari on an Apple device, or when the browser exposes `ApplePaySession`; other browsers show Google Pay. iPad desktop mode is recognized by its Mac platform and multiple touch points. This display choice is a browser/device heuristic, not a wallet eligibility check. On the new page the wallet radio remains selectable and reveals the disabled button and explanation. No Apple Pay/Google Pay SDK, payment session, order, or capture is started.
 
-Open the card option to render PayPal-hosted name, number, expiry, and CVV fields. Enter sandbox card details and a billing address, then select **Pay by card**. All card requests use `payment_source.card.attributes.verification.method=SCA_ALWAYS`; the SDK submits card and billing details directly to PayPal and handles authentication. Only flow/page, the save-consent flag on the new page, and the idempotency UUID go from this form to the Worker. Before capturing a card, the backend retrieves its authentication result from PayPal and requires status `APPROVED` with `three_d_secure.authentication_status=Y`. Failed, incomplete, attempted-only, or absent authentication is blocked. Successful frictionless authentication is accepted; a visible bank challenge is not guaranteed.
+On the new page no payment control is rendered until its radio is selected. The PayPal button and hosted card iframes render once and are reused when switching methods; save-checkbox choices remain intact. Selecting a method never creates an order. During payment or an unresolved result the radio selector is locked, while card authentication remains interactive. Reloading an existing checkout restores its method and status for recovery.
+
+Select the card radio on the new page, or open the card option on the returning page, to render PayPal-hosted name, number, expiry, and CVV fields. Enter sandbox card details and a billing address, then select **Pay by card**. All card requests use `payment_source.card.attributes.verification.method=SCA_ALWAYS`; the SDK submits card and billing details directly to PayPal and handles authentication. Only flow/page, the save-consent flag on the new page, and the idempotency UUID go from this form to the Worker. Before capturing a card, the backend retrieves its authentication result from PayPal and requires status `APPROVED` with `three_d_secure.authentication_status=Y`. Failed, incomplete, attempted-only, or absent authentication is blocked. Successful frictionless authentication is accepted; a visible bank challenge is not guaranteed.
 
 On the new page, selecting the save checkbox adds `store_in_vault: ON_SUCCESS` to that payment source. A successful opted-in PayPal or card purchase replaces the shared saved method. Unchecked purchases, purchases through the other methods on the returning page, and failed payments preserve it. The cache records the method type and minimal card display data (brand, last digits, expiry) in addition to the vault/customer IDs; card numbers and security codes are never stored.
 
@@ -97,7 +99,7 @@ Alternatively, after `npx wrangler login`, configure secrets interactively with 
 
 Use a sandbox merchant REST app with PayPal vaulting enabled and a separate sandbox buyer account. `saved-payment-methods` / `SavedPaymentMethods` must be available to that REST app in the sandbox SDK. If it is missing, confirm component availability with your PayPal contact; the page reports this explicitly instead of replacing the component with a different UI.
 
-1. On **New customer**, select **Save payment method for future payments** for PayPal, then complete a sandbox purchase. Confirm a completed capture and a saved vault ID.
+1. On **New customer**, select the **PayPal** radio, select **Save payment method for future payments**, then complete a sandbox purchase. Confirm a completed capture and a saved vault ID.
 2. Open **Returning customer**. Confirm the actual PayPal component displays the saved payment method.
 3. Test the edit path: engage the component and approve in PayPal. Confirm the Order ID is visible and no capture has occurred. Click **Place order with saved method** and confirm that the same order is captured and its Transaction ID is displayed. Duplicate clicks must not create another payment.
 4. Select **Start another returning-customer purchase**. Keep the saved method and press **Place order with saved method**. Confirm it completes without a second `/capture` request.
@@ -105,7 +107,7 @@ Use a sandbox merchant REST app with PayPal vaulting enabled and a separate sand
 6. Complete a new-customer purchase with saving selected and a different buyer. The returning page should now use the replacement vault ID. A returning page left open with the old buyer will reject payment and request a reload.
 7. Cancel a new checkout or test a declined capture. The previous saved buyer should remain selected.
 8. Complete a purchase with the save checkbox unchecked for each payment type. Confirm the saved method remains unchanged.
-9. On the new page, select the card save checkbox and use a 3DS-enabled sandbox card. After successful authentication and capture, confirm the saved method is now a card with its brand and last digits.
+9. On the new page, select the **Credit or debit card** radio, select the card save checkbox, and use a 3DS-enabled sandbox card. After successful authentication and capture, confirm the saved method is now a card with its brand and last digits.
 10. Open the returning page and select **Place order with saved card**. Follow PayPal's 3DS flow. After returning, select **Complete approved card payment** to capture. Confirm the create, confirm, and capture details and transaction ID. Failed/incomplete authentication must not permit capture.
 
 ## How the integration works

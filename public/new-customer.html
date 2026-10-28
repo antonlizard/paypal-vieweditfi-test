@@ -13,18 +13,23 @@
     <header class="topbar"><a class="brand" href="/new-customer"><span class="brand-mark">E</span><span>EditFI <span class="muted">test lab</span></span></a><span class="badge"><span class="dot"></span>PayPal sandbox</span></header>
     <nav class="flow-nav" aria-label="Checkout flows"><a href="/new-customer" aria-current="page"><span class="step">1</span> New customer</a><a href="/returning-customer"><span class="step">2</span> Returning customer</a></nav>
     <main>
-      <div class="page-heading"><p class="eyebrow">PURCHASE &amp; SAVE</p><h1>A first checkout.<br>Your choice to save.</h1><p>Choose PayPal or a sandbox card, and decide whether to save it for your next purchase.</p></div>
+      <div class="page-heading"><p class="eyebrow">PURCHASE &amp; SAVE</p><h1>A first checkout.<br>Your choice to save.</h1><p>Choose a payment method for your sandbox purchase. PayPal and card payments can be saved for next time.</p></div>
       <div class="grid">
         <section class="card checkout" aria-labelledby="checkout-title">
           <div class="section-label"><span>FLOW 01</span><span>NEW CUSTOMER</span></div>
           <h2 id="checkout-title">Test purchase</h2>
           <div class="product"><span class="product-icon" aria-hidden="true">↗</span><div><strong>EditFI test item</strong><p>One sandbox purchase</p></div><strong class="amount" data-amount>—</strong></div>
           <div class="total"><span>Total</span><strong data-amount>—</strong></div>
-          <div id="checkout-controls"><p class="payment-label">Pay with PayPal</p><label class="save-choice"><input id="save-paypal" type="checkbox">Save payment method for future payments</label><div id="paypal-button-container" class="sdk-container"></div></div>
-          <div id="alternative-controls" class="alternative-payments">
-            <p class="payment-label">Other payment methods</p>
-            <details id="card-option" class="payment-option">
-              <summary><span>Credit or debit card</span><span class="method-badge">Sandbox</span></summary>
+          <fieldset id="payment-methods" class="payment-methods" aria-describedby="payment-method-hint">
+            <legend>Payment method</legend>
+            <p id="payment-method-hint" class="supporting">Select a payment method to continue.</p>
+            <label class="payment-choice"><input id="method-paypal" type="radio" name="payment-method" value="paypal" aria-controls="checkout-controls" autocomplete="off"><span>PayPal</span></label>
+            <label class="payment-choice"><input id="method-card" type="radio" name="payment-method" value="card" aria-controls="card-option" autocomplete="off"><span>Credit or debit card</span></label>
+            <label class="payment-choice"><input id="method-wallet" type="radio" name="payment-method" value="wallet" aria-controls="wallet-panel" autocomplete="off"><span id="wallet-choice-label">Digital wallet</span></label>
+          </fieldset>
+          <div id="checkout-controls" class="selected-payment" hidden><label class="save-choice"><input id="save-paypal" type="checkbox">Save payment method for future payments</label><div id="paypal-button-container" class="sdk-container"></div></div>
+          <div id="alternative-controls" class="selected-payment" hidden>
+            <section id="card-option" aria-label="Credit or debit card details" hidden>
               <p id="card-status" class="supporting" role="status">Loading secure card fields…</p>
               <form id="card-form" hidden>
                 <p class="field-label">Cardholder name</p><div id="card-name-field" class="card-field"></div>
@@ -40,9 +45,11 @@
                 <button id="card-submit" class="button primary" type="submit" disabled>Pay by card <span data-amount>—</span></button>
                 <p class="component-note">PayPal securely collects your card details. Card payments request 3D Secure authentication using SCA_ALWAYS.</p>
               </form>
-            </details>
-            <button id="wallet-option" class="button wallet-placeholder" type="button" disabled aria-describedby="wallet-note"><span id="wallet-label">Digital wallet</span><span class="method-badge">Display only</span></button>
-            <p id="wallet-note" class="component-note">Wallet checkout is not connected in this test.</p>
+            </section>
+            <div id="wallet-panel" hidden>
+              <button id="wallet-option" class="button wallet-placeholder" type="button" disabled aria-describedby="wallet-note"><span id="wallet-label">Digital wallet</span><span class="method-badge">Display only</span></button>
+              <p id="wallet-note" class="component-note">Wallet checkout is not connected in this test.</p>
+            </div>
           </div>
           <div id="status" class="status" role="status" aria-live="polite">Loading checkout…</div>
           <section id="payment-details" class="payment-details" aria-labelledby="payment-details-title" aria-live="polite" hidden>
