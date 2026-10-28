@@ -8,14 +8,16 @@ This is a **sandbox-only integration test**. It defaults to a $10.00 USD purchas
 
 | Page | Behavior |
 | --- | --- |
-| `/new-customer` | Renders PayPal Buttons with `vault=true`. Creates an order with `store_in_vault: ON_SUCCESS`, captures it after approval, and saves the returned vault ID. |
-| `/returning-customer` | Uses the latest saved buyer to mint a vault-scoped SDK client token and render `SavedPaymentMethods`. Supports editing through PayPal and paying directly with the saved method. |
+| `/new-customer` | Offers PayPal Buttons and Card Fields. Each has an unchecked **Save payment method for future payments** checkbox. Only an opted-in successful purchase saves its method. |
+| `/returning-customer` | Offers the last method saved with a purchase. Saved PayPal uses ViewEditFI; saved cards use a masked card option with 3DS. Other payment options remain available. |
 
 Both pages display the shared saved buyer and an expandable activity panel. The returning page shows an empty state until a payment method is available. No simulated funding instrument is displayed.
 
 Both pages also offer **Credit or debit card** through real PayPal Sandbox **Card Fields** and a disabled, **display-only** digital wallet option. Apple Pay is shown when the browser exposes `ApplePaySession`, or for Safari on an Apple device; other browsers show Google Pay. This display choice is a browser/device heuristic, not a wallet eligibility check. No Apple Pay/Google Pay SDK, payment session, order, or capture is started.
 
-Open the card option to render PayPal-hosted name, number, expiry, and CVV fields. Enter sandbox card details and a billing address, then select **Pay by card**. The backend creates an Orders v2 order with `payment_source.card.attributes.verification.method=SCA_WHEN_REQUIRED`; the SDK submits card and billing details directly to PayPal and handles authentication. Only `flow`, page, and the idempotency UUID go from this form to the Worker. After SDK approval, the backend captures that card order. Card payments work on either page without a saved PayPal buyer and never replace the shared PayPal vault/customer IDs.
+Open the card option to render PayPal-hosted name, number, expiry, and CVV fields. Enter sandbox card details and a billing address, then select **Pay by card**. All card requests use `payment_source.card.attributes.verification.method=SCA_ALWAYS`; the SDK submits card and billing details directly to PayPal and handles authentication. Only flow/page, the save-consent flag on the new page, and the idempotency UUID go from this form to the Worker. Before capturing a card, the backend retrieves its authentication result from PayPal and requires status `APPROVED` with `three_d_secure.authentication_status=Y`. Failed, incomplete, attempted-only, or absent authentication is blocked. Successful frictionless authentication is accepted; a visible bank challenge is not guaranteed.
+
+On the new page, selecting the save checkbox adds `store_in_vault: ON_SUCCESS` to that payment source. A successful opted-in PayPal or card purchase replaces the shared saved method. Unchecked purchases, purchases through the other methods on the returning page, and failed payments preserve it. The cache records the method type and minimal card display data (brand, last digits, expiry) in addition to the vault/customer IDs; card numbers and security codes are never stored.
 
 The Sandbox business account/app must be enabled for **Advanced Credit and Debit Card Payments**. The page checks `CardFields.isEligible()` and displays an availability message instead of fake card inputs when it cannot render. Use the [PayPal sandbox card generator](https://developer.paypal.com/tools/sandbox/card-testing/) for testing, including [3D Secure scenarios](https://developer.paypal.com/v5/expanded/3d-secure/test/). Card Fields are rendered only after opening the card option, so their iframe sizes can be measured in a visible container.
 
@@ -23,7 +25,7 @@ The returning page displays the Order ID as soon as ViewEditFI creates the order
 
 Order and Transaction IDs also appear for card payments on both pages. Duplicate submissions reuse the same payment operation. Interrupted captures require a status check; an approved card order can be captured using **Complete approved card payment**. Reloads and card return redirects restore that browser's existing card attempt without automatically capturing. An unapproved card order confirmed by a status check can be retried with its original create key when no capture was attempted.
 
-Both pages include expandable **Create order** and **Capture** panels showing the backend's PayPal REST method, URL, safe headers, JSON request body, response HTTP status, and full response body. Errors are shown too. Capture details appear only after a capture is requested; direct saved-method payments identify that no separate capture call was sent and show the payment result in Create order.
+Both pages include expandable **Create order**, **Confirm saved card / 3DS**, and **Capture** panels showing the backend's PayPal REST method, URL, safe headers, JSON request body, response HTTP status, and full response body. Errors are shown too. Confirm details apply to saved-card purchases. Capture details appear only after a capture is requested; direct saved-PayPal payments identify that no separate capture call was sent and show the payment result in Create order.
 
 Traces are retained with the checkout for retries and reloads. New create/capture calls display the used Bearer authorization method and exact access token in `request.authentication`, together with the actual `Authorization` header. These values appear only in the immediate response on the Basic-authenticated test pages and remain in that page's memory while it is open. Saved traces redact token values; after a reload, start a new request to see its used token. The page preserves each call's own token when later responses refresh the panels.
 
@@ -95,19 +97,22 @@ Alternatively, after `npx wrangler login`, configure secrets interactively with 
 
 Use a sandbox merchant REST app with PayPal vaulting enabled and a separate sandbox buyer account. `saved-payment-methods` / `SavedPaymentMethods` must be available to that REST app in the sandbox SDK. If it is missing, confirm component availability with your PayPal contact; the page reports this explicitly instead of replacing the component with a different UI.
 
-1. Complete a purchase on **New customer** with the sandbox buyer. Confirm a completed capture and a saved vault ID.
+1. On **New customer**, select **Save payment method for future payments** for PayPal, then complete a sandbox purchase. Confirm a completed capture and a saved vault ID.
 2. Open **Returning customer**. Confirm the actual PayPal component displays the saved payment method.
 3. Test the edit path: engage the component and approve in PayPal. Confirm the Order ID is visible and no capture has occurred. Click **Place order with saved method** and confirm that the same order is captured and its Transaction ID is displayed. Duplicate clicks must not create another payment.
 4. Select **Start another returning-customer purchase**. Keep the saved method and press **Place order with saved method**. Confirm it completes without a second `/capture` request.
 5. Reload or use another browser with the same Basic credentials. The saved vault ID should remain the same.
-6. Complete a new-customer purchase with a different buyer. The returning page should now use the replacement vault ID. A returning page left open with the old buyer will reject payment and request a reload.
+6. Complete a new-customer purchase with saving selected and a different buyer. The returning page should now use the replacement vault ID. A returning page left open with the old buyer will reject payment and request a reload.
 7. Cancel a new checkout or test a declined capture. The previous saved buyer should remain selected.
+8. Complete a purchase with the save checkbox unchecked for each payment type. Confirm the saved method remains unchanged.
+9. On the new page, select the card save checkbox and use a 3DS-enabled sandbox card. After successful authentication and capture, confirm the saved method is now a card with its brand and last digits.
+10. Open the returning page and select **Place order with saved card**. Follow PayPal's 3DS flow. After returning, select **Complete approved card payment** to capture. Confirm the create, confirm, and capture details and transaction ID. Failed/incomplete authentication must not permit capture.
 
 ## How the integration works
 
 ### New customer
 
-The SDK loads from `https://www.sandbox.paypal.com/sdk/js` with `components=buttons,card-fields`, `vault=true`, and `intent=capture`. The PayPal vaulting flow creates an order using:
+The SDK loads from `https://www.sandbox.paypal.com/sdk/js` with `components=buttons,card-fields`, `vault=true`, and `intent=capture`. The SDK supports optional vaulting; the backend adds vault instructions only when the corresponding checkbox is selected. An opted-in PayPal purchase creates an order using:
 
 ```js
 payment_source: {
@@ -125,11 +130,11 @@ payment_source: {
 }
 ```
 
-After approval the server captures the order and reads `payment_source.paypal.attributes.vault.id` and `vault.customer.id` from the response. Each new checkout has a unique merchant customer ID; this harness has one shared active buyer instead of user accounts.
+After approval the server captures the order and, for an opted-in purchase, reads `payment_source.paypal.attributes.vault.id` or `payment_source.card.attributes.vault.id` and the associated customer ID. Each saving checkout has a unique merchant customer ID; this harness has one shared saved method instead of user accounts. The consent and exact request payload are fixed per idempotency UUID.
 
 ### Returning customer: ViewEditFI
 
-The server resolves the selected vault ID and calls `POST /v1/oauth2/token` with URL-encoded form fields:
+When the last saved method is **PayPal**, the server resolves its vault ID and calls `POST /v1/oauth2/token` with URL-encoded form fields:
 
 ```text
 grant_type=client_credentials
@@ -151,10 +156,18 @@ The component's `createOrder` callback invokes the server only when the buyer en
 
 If the buyer keeps the saved method, the separate place-order button calls the server with the expected cache revision. The server uses **`payment_source.paypal.vault_id`**. A completed auto-capture response is handled directly; the app never also captures that direct-charge order. An incomplete or payer-action-required result is shown as incomplete, not paid.
 
+### Returning customer: saved card
+
+ViewEditFI is used for saved PayPal accounts. A saved card is displayed using its brand, last digits, and expiry, alongside new Card Fields, PayPal Buttons, and the display-only wallet. The saved-card flow does not mint a PayPal-wallet-scoped SDK token.
+
+Selecting **Place order with saved card** calls the backend with a request UUID and cache revision. The server first creates an order without a payment source, then calls **`/v2/checkout/orders/{id}/confirm-payment-source`** with the server-resolved `payment_source.card.vault_id`, `verification.method=SCA_ALWAYS`, and customer-initiated, one-time, subsequent stored-credential indicators. Creation and confirmation have separate stable idempotency keys. Confirmation retries reuse the same order.
+
+The backend validates the returned PayPal `payer-action` URL and appends the merchant return URI as `redirect_uri`. The browser follows it for authentication. On return, it retrieves order status without capturing automatically. Only an order that PayPal reports as `APPROVED` and successfully authenticated (`Y`) enables **Complete approved card payment**. The backend rechecks the current saved-method revision and PayPal authentication result immediately before capture; browser claims cannot bypass those checks. A frictionless result already approved on the initial Place order action can be captured by that action. Status checks and reloads remain read-only.
+
 ### Cache and payment handling
 
 - One named Durable Object per PayPal REST app holds the current vault ID. Returning checkouts do not replace it or give it a time-to-live. Changing the client ID selects separate state.
-- Only a completed new-customer payment replaces the buyer. An abandoned/failed checkout preserves the previous buyer. Old capture callbacks cannot overwrite a newer successful checkout.
+- Only a completed new-customer purchase with explicit save consent replaces the method. An unchecked, abandoned, or failed checkout preserves the previous method. Late PayPal/card captures cannot overwrite a more recent successful opted-in purchase.
 - Every returning token/order/capture is checked against the cache revision. A page opened before another buyer replaced the cache must reload.
 - Duplicate clicks, retries, and interrupted responses reuse stable `PayPal-Request-Id` values. The exact request payload is persisted before a create call. An unresolved create older than five hours is blocked to avoid retrying after PayPal's default idempotency window may have elapsed.
 - Browser session storage holds request UUIDs only. The vault ID is stored server-side. The REST app secret stays on the server. The used Bearer access token is displayed in the protected request panels for new calls and redacted from saved history; the vault-scoped client token is supplied only for SDK initialization. Neither token is written to browser storage or activity logs.
@@ -163,7 +176,7 @@ If the buyer keeps the saved method, the separate place-order button calls the s
 
 ### Optional: asynchronous vault completion
 
-PayPal can complete a payment but return `vault.status=APPROVED` before a token is ready. In that case the app selects the **new pending buyer** and blocks returning payments, so the old buyer cannot accidentally be charged. **Refresh saved buyer** checks the original order again.
+PayPal can complete a PayPal or card payment but return `vault.status=APPROVED` before a token is ready. In that case the app selects the **new pending method** and blocks returning payments, so the old method cannot accidentally be charged. **Refresh saved method** checks the original order again. A card token webhook must identify a card source and match the pending checkout; a PayPal token cannot activate a pending card.
 
 For event-driven completion, register your Worker's `/api/paypal/webhook` URL for **`VAULT.PAYMENT-TOKEN.CREATED`** on the same sandbox REST app, and set the returned **`PAYPAL_WEBHOOK_ID`** as a Worker variable or secret. The endpoint is disabled unless this ID is configured.
 

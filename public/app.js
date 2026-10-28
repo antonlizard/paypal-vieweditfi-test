@@ -2,11 +2,15 @@ const $ = (id) => document.getElementById(id);
 const flow = document.body.dataset.flow;
 let settings, buyer, mounted = false, busy = false, paid = false, unresolved = false, lastOrderId, approvedOrderId, submittingPayment = false;
 let cardFields, cardMounted = false, cardRendering, cardSubmitting = false, cardOrderId, approvedCardOrderId, cardCapturePromise, activeMethod = "paypal";
+let savePayPalChoice = false, saveCardChoice = false, savedCardAuthenticationUrl;
 const activity = [];
 const displayedAuthorizations = new Map();
 const context = () => flow === "new" ? "new" : `returning:${buyer?.revision}`;
 const storageKey = (kind) => `editfi:${kind === "card" ? flow : context()}:${kind}`;
 const placeOrderPrompt = 'Payment method approved. Click "Place order with saved method" to complete the purchase.';
+const savedCard = () => buyer?.methodType === "card";
+const savedPayPal = () => flow === "returning" && buyer?.state === "VAULTED" && !savedCard();
+const cardLabel = (value) => `${value?.brand || "Card"} •••• ${value?.lastDigits || ""}`.trim();
 
 function log(event, data) {
   activity.unshift({ time: new Date().toLocaleTimeString(), event, ...(data ? { data } : {}) });
@@ -20,7 +24,7 @@ function status(message, type = "") {
 
 function resetApiTraces() {
   displayedAuthorizations.clear();
-  for (const kind of ["create", "capture"]) {
+  for (const kind of ["create", "confirm", "capture"]) {
     $(`${kind}-trace`).open = false;
     $(`${kind}-trace-status`).textContent = "Not requested";
     $(`${kind}-request`).textContent = "No request recorded yet.";
@@ -29,7 +33,7 @@ function resetApiTraces() {
 }
 
 function showApiTraces(traces) {
-  for (const kind of ["create", "capture"]) {
+  for (const kind of ["create", "confirm", "capture"]) {
     const trace = traces[kind];
     if (!trace) continue;
     $(`${kind}-trace`).open = true;
@@ -66,6 +70,11 @@ function controls() {
   $("card-submit").disabled = locked || !cardMounted;
   $("resume-card").hidden = paid || !approvedCardOrderId;
   $("resume-card").disabled = busy || submittingPayment || cardSubmitting;
+  if ($("authenticate-saved-card")) {
+    $("authenticate-saved-card").hidden = paid || !savedCardAuthenticationUrl;
+    $("authenticate-saved-card").disabled = busy || submittingPayment;
+  }
+  for (const id of ["save-paypal", "save-card"]) if ($(id)) $(id).disabled = locked;
   $("check-status").hidden = !unresolved;
   $("success-actions").hidden = !paid;
   if (paid) {
@@ -125,7 +134,9 @@ function showBuyer(value) {
   $("vault-message").textContent = value?.state === "VAULTED" ? "Ready for returning-customer checkout." : value ? "Payment completed; PayPal has not returned a vaulted token yet. Refresh or wait for the vault webhook." : "Complete a new-customer purchase to save a buyer.";
   $("vault-id").textContent = value?.vaultId || "—";
   $("customer-id").textContent = value?.customerId || "—";
-  $("buyer-email").textContent = value?.payerEmail || "—";
+  $("saved-method-type").textContent = value ? value.methodType === "card" ? "Credit / debit card" : "PayPal" : "—";
+  $("buyer-detail-label").textContent = value?.methodType === "card" ? "Saved card" : "Buyer";
+  $("buyer-email").textContent = value?.methodType === "card" ? cardLabel(value.card) : value?.payerEmail || "—";
   $("saved-at").textContent = value?.savedAt ? new Date(value.savedAt).toLocaleString() : "—";
 }
 
@@ -152,7 +163,8 @@ async function finish(result) {
   const current = await api("/api/state");
   showBuyer(current.buyer);
   if (paid) {
-    status(`${activeMethod === "card" ? "Card payment" : "Payment"} completed. Order ${order.id}.${activeMethod !== "card" && flow === "new" && current.buyer?.state !== "VAULTED" ? " Vaulting is pending; refresh the saved buyer before using the returning flow." : ""}`, "success");
+    const saving = flow === "new" && (activeMethod === "card" ? saveCardChoice : savePayPalChoice);
+    status(`${activeMethod.includes("card") ? "Card payment" : "Payment"} completed. Order ${order.id}.${saving && current.buyer?.state !== "VAULTED" ? " Vaulting is pending; refresh the saved method before using it." : ""}`, "success");
   } else {
     status(`Order ${order.id}: ${order.status}. Payment is not confirmed. Check its status before starting another purchase.`);
   }
@@ -192,10 +204,12 @@ async function createOrder() {
   controls();
   status("Creating the PayPal order…");
   try {
+    savePayPalChoice = flow === "new" && $("save-paypal").checked;
     const result = await api("/api/orders", {
-      flow,
+      flow: flow === "new" ? "new" : savedPayPal() ? "returning" : "paypal",
+      ...(flow === "new" ? { savePaymentMethod: savePayPalChoice } : savedPayPal() ? {} : { page: "returning" }),
       requestId: requestId("component"),
-      ...(flow === "returning" ? { vaultRevision: buyer.revision } : {}),
+      ...(savedPayPal() ? { vaultRevision: buyer.revision } : {}),
     });
     lastOrderId = result.order.id;
     showPaymentDetails(result.order);
@@ -209,8 +223,8 @@ async function createOrder() {
 }
 
 async function onApprove(data) {
-  if (cardSubmitting || activeMethod === "card") return;
-  if (flow === "returning") {
+  if (cardSubmitting || activeMethod !== "paypal") return;
+  if (savedPayPal()) {
     if (paid || unresolved || submittingPayment) return;
     awaitPlacement({ id: data.orderID });
     return;
@@ -219,7 +233,10 @@ async function onApprove(data) {
 }
 
 async function captureOrder(orderID) {
-  if (activeMethod === "card") approvedCardOrderId = undefined;
+  if (activeMethod.includes("card")) {
+    approvedCardOrderId = undefined;
+    savedCardAuthenticationUrl = undefined;
+  }
   busy = true;
   submittingPayment = true;
   controls();
@@ -253,10 +270,10 @@ function onCancel() {
 
 function loadSDK(clientToken) {
   return new Promise((resolve, reject) => {
-    const components = flow === "returning" && buyer?.state === "VAULTED" ?
+    const components = savedPayPal() ?
       "buttons,funding-eligibility,messages,saved-payment-methods,card-fields" : "buttons,card-fields";
     const parameters = new URLSearchParams({
-      "client-id": settings.clientId, components, vault: "true", commit: flow === "returning" ? "false" : "true",
+      "client-id": settings.clientId, components, vault: "true", commit: savedPayPal() ? "false" : "true",
       intent: "capture", currency: settings.currency,
     });
     const script = document.createElement("script");
@@ -271,21 +288,27 @@ function loadSDK(clientToken) {
 }
 
 async function recoverAttempt() {
-  for (const kind of ["card", "direct", "component"]) {
+  for (const kind of ["saved-card", "card", "direct", "component"]) {
     const key = sessionStorage.getItem(storageKey(kind));
     if (!key) continue;
     const previous = await api(`/api/operations/${encodeURIComponent(key)}`);
+    if (kind === "component" && flow === "new" && typeof previous.savePaymentMethod === "boolean") {
+      savePayPalChoice = $("save-paypal").checked = previous.savePaymentMethod;
+    }
+    if (kind === "card" && flow === "new" && typeof previous.savePaymentMethod === "boolean") {
+      saveCardChoice = $("save-card").checked = previous.savePaymentMethod;
+    }
     if (!previous.order?.id) continue;
     const result = await api(`/api/orders/${encodeURIComponent(previous.order.id)}`);
-    if (kind === "card") {
-      await restoreCard(result);
+    if (["card", "saved-card"].includes(kind)) {
+      await restoreCard(result, kind);
       return true;
     }
     if (result.order.completed || kind === "direct" || hasCapture(result.order)) {
       await finish(result);
       return true;
     }
-    if (flow === "returning" && result.order.status === "APPROVED") {
+    if (savedPayPal() && result.order.status === "APPROVED") {
       awaitPlacement(result.order);
       return false;
     }
@@ -304,7 +327,7 @@ async function start() {
   });
   log("Configuration loaded", { environment: settings.environment, amount: settings.amount, currency: settings.currency });
   const query = new URLSearchParams(location.search);
-  if (query.get("card")) {
+  if (query.get("card") || query.get("saved-card")) {
     history.replaceState(null, "", location.pathname);
     // Restore only an order belonging to this browser's card attempt. Redirects
     // and reloads check status; they never submit a fresh payment or capture.
@@ -338,7 +361,7 @@ async function start() {
   if (!approvedOrderId && !cardOrderId) await recoverAttempt();
   if (paid) return;
   let token;
-  if (flow === "returning" && buyer?.state === "VAULTED") {
+  if (savedPayPal()) {
     try {
       token = await api("/api/client-token", { vaultRevision: buyer.revision });
       log("Vault-scoped SDK client token issued", { expiresIn: token.expiresIn });
@@ -359,8 +382,21 @@ async function start() {
     // The guide passes no vaultId to this constructor. Scope comes exclusively
     // from the SDK script's data-sdk-client-token attribute above.
     await paypal.SavedPaymentMethods(callbacks).render("#saved-payment-methods-container");
+  } else {
+    $("other-paypal-option").hidden = false;
+    await paypal.Buttons({ ...callbacks, fundingSource: paypal.FUNDING.PAYPAL, style: { layout: "vertical", shape: "rect", label: "paypal", height: 48 } }).render("#other-paypal-buttons");
+    if (savedCard() && buyer.state === "VAULTED") {
+      $("checkout-controls").hidden = false;
+      $("saved-card-method").hidden = false;
+      $("saved-payment-methods-container").hidden = true;
+      $("saved-card-description").textContent = cardLabel(buyer.card);
+      $("saved-card-expiry").textContent = buyer.card?.expiry ? `Expires ${buyer.card.expiry}` : "";
+      $("saved-method-note").textContent = "Use your saved card. This purchase requests SCA_ALWAYS authentication.";
+      $("saved-method-capture-note").textContent = "Complete 3D Secure authentication before the payment is captured.";
+      $("place-order").textContent = "Place order with saved card";
+    }
   }
-  mounted = flow === "new" || Boolean(token);
+  mounted = flow === "new" || Boolean(token) || (savedCard() && buyer.state === "VAULTED");
   controls();
   if (!unresolved && !cardOrderId) status(approvedOrderId ? placeOrderPrompt : flow === "new" ? "Ready. Use PayPal to pay and save, or choose a card payment." : mounted ? "Ready. Review or edit the saved method, or choose a card payment." : "No saved PayPal method is ready. You can pay by card below.");
   if (mounted) log(flow === "new" ? "PayPal Buttons rendered" : "SavedPaymentMethods rendered");
@@ -390,7 +426,7 @@ function cardError(error) {
 
 async function createCardOrder() {
   if (!cardSubmitting || paid || unresolved) throw new Error("Submit the card form to start this payment.");
-  const result = await api("/api/orders", { flow: "card", page: flow, requestId: requestId("card") });
+  const result = await api("/api/orders", { flow: "card", page: flow, requestId: requestId("card"), ...(flow === "new" ? { savePaymentMethod: saveCardChoice } : {}) });
   cardOrderId = lastOrderId = result.order.id;
   showPaymentDetails(result.order);
   log("Card order created", { orderID: cardOrderId });
@@ -438,18 +474,19 @@ function initializeCardFields(paypal) {
   }
 }
 
-async function restoreCard(result) {
-  activeMethod = "card";
+async function restoreCard(result, method = activeMethod.includes("card") ? activeMethod : "card") {
+  activeMethod = method;
   cardOrderId = lastOrderId = result.order.id;
   if (result.order.completed || hasCapture(result.order)) return finish(result);
   busy = false;
   showPaymentDetails(result.order);
-  approvedCardOrderId = result.order.status === "APPROVED" ? result.order.id : undefined;
+  approvedCardOrderId = result.order.status === "APPROVED" && result.order.cardAuthenticated === true ? result.order.id : undefined;
+  savedCardAuthenticationUrl = method === "saved-card" ? result.order.payerActionUrl : undefined;
   // A confirmed unapproved order can be retried with the SAME create key. A
   // previous capture attempt always keeps the checkout locked for recovery.
   const retryable = ["CREATED", "PAYER_ACTION_REQUIRED"].includes(result.order.status) && !result.traces?.capture?.attempted;
-  unresolved = !retryable;
-  status(approvedCardOrderId ? "Card payment approved. Click Complete approved card payment to capture this order." :
+  unresolved = Boolean(savedCardAuthenticationUrl) || !retryable;
+  status(approvedCardOrderId ? "Card payment approved. Click Complete approved card payment to capture this order." : savedCardAuthenticationUrl ? "Complete card authentication before capturing this payment." :
     retryable ? "Card payment is not approved. Review the card details and retry the same checkout." : "Card payment is not confirmed. Check its status before another purchase.");
   controls();
 }
@@ -466,6 +503,7 @@ $("card-form").addEventListener("submit", async (event) => {
       return;
     }
     activeMethod = "card";
+    saveCardChoice = flow === "new" && $("save-card").checked;
     approvedOrderId = approvedCardOrderId = cardOrderId = lastOrderId = undefined;
     sessionStorage.removeItem(storageKey("component"));
     sessionStorage.removeItem(storageKey("direct"));
@@ -492,13 +530,57 @@ $("card-form").addEventListener("submit", async (event) => {
 
 $("resume-card").addEventListener("click", async () => {
   if (!approvedCardOrderId || busy || paid || submittingPayment || cardSubmitting) return;
-  activeMethod = "card";
   await captureOrder(approvedCardOrderId).catch(() => {});
   controls();
 });
 
+async function payWithSavedCard() {
+  busy = submittingPayment = true;
+  activeMethod = "saved-card";
+  cardOrderId = lastOrderId = approvedCardOrderId = savedCardAuthenticationUrl = undefined;
+  for (const kind of ["card", "component", "direct"]) sessionStorage.removeItem(storageKey(kind));
+  resetApiTraces();
+  showPaymentDetails(null);
+  status("Preparing your saved card for 3D Secure authentication…");
+  controls();
+  try {
+    const result = await api("/api/orders", { flow: "saved-card", requestId: requestId("saved-card"), vaultRevision: buyer.revision });
+    await restoreCard(result, "saved-card");
+    if (savedCardAuthenticationUrl) {
+      // The backend validates this PayPal HATEOAS URL and supplies our return
+      // URI. No card capture is made before successful issuer authentication.
+      location.assign(savedCardAuthenticationUrl);
+    } else if (approvedCardOrderId) {
+      await captureOrder(approvedCardOrderId);
+    }
+  } catch (error) {
+    unresolved = !paid;
+    showError(error);
+  } finally {
+    busy = submittingPayment = false;
+    controls();
+  }
+}
+
+$("authenticate-saved-card")?.addEventListener("click", () => {
+  if (savedCardAuthenticationUrl && !paid && !busy && !submittingPayment) location.assign(savedCardAuthenticationUrl);
+});
+
+for (const [id, kind] of [["save-paypal", "component"], ["save-card", "card"]]) {
+  $(id)?.addEventListener("change", () => {
+    if (busy || paid || unresolved || submittingPayment || cardSubmitting) return;
+    // Changing consent starts a different unsubmitted attempt. Retries of the
+    // original operation always retain their original vault instruction.
+    sessionStorage.removeItem(storageKey(kind));
+  });
+}
+
 $("place-order")?.addEventListener("click", async () => {
   if (busy || paid || unresolved || submittingPayment || !mounted) return;
+  if (savedCard()) {
+    await payWithSavedCard();
+    return;
+  }
   if (approvedOrderId) {
     // Approval chooses the instrument; only this explicit merchant-page action
     // captures that exact order. Never create a second direct-charge order.
@@ -534,7 +616,7 @@ $("check-status").addEventListener("click", async () => {
   try {
     if (lastOrderId) {
       const result = await api(`/api/orders/${encodeURIComponent(lastOrderId)}`);
-      if (activeMethod === "card") {
+      if (activeMethod.includes("card")) {
         await restoreCard(result);
       } else if (approvedOrderId === lastOrderId && result.order.status === "APPROVED" && !hasCapture(result.order)) {
         awaitPlacement(result.order);
@@ -542,6 +624,12 @@ $("check-status").addEventListener("click", async () => {
         await finish(result);
       }
     } else {
+      if (activeMethod === "saved-card") {
+        await recoverAttempt();
+        busy = false;
+        controls();
+        return;
+      }
       // Recover a direct-charge response lost before the order ID arrived.
       // Reuse the exact existing key; never create a fresh payment attempt.
       const key = sessionStorage.getItem(storageKey("direct"));
@@ -561,7 +649,7 @@ $("refresh-vault").addEventListener("click", async () => {
 });
 
 $("another-checkout").addEventListener("click", () => {
-  for (const kind of ["card", "direct", "component"]) sessionStorage.removeItem(storageKey(kind));
+  for (const kind of ["saved-card", "card", "direct", "component"]) sessionStorage.removeItem(storageKey(kind));
   location.href = location.pathname;
 });
 

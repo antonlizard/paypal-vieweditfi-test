@@ -19,7 +19,8 @@ function harness() {
   const orders = new Map();
   const requestIds = new Map();
   let serial = 0;
-  const mock = { vaultStatus: "VAULTED", captureStatus: "COMPLETED", directStatus: "COMPLETED", failCapture: false, loseCreateResponse: false, verification: "SUCCESS", charges: 0 };
+  const mock = { vaultStatus: "VAULTED", captureStatus: "COMPLETED", directStatus: "COMPLETED", failCapture: false, loseCreateResponse: false, verification: "SUCCESS", charges: 0,
+    cardAuthenticationStatus: "Y", savedCardApproved: false, loseConfirmResponse: false };
   const env = {
     PAYPAL_ENV: "sandbox", PAYPAL_CLIENT_ID: "sandbox-client-id", PAYPAL_CLIENT_SECRET: "server-only-secret",
     BASIC_AUTH_USERNAME: "editfi", BASIC_AUTH_PASSWORD: "test-only-password", PAYPAL_CURRENCY: "USD", PAYPAL_AMOUNT: "10.00",
@@ -27,16 +28,21 @@ function harness() {
   };
   let store;
   function completed(order, id, vaultStatus = mock.vaultStatus) {
-    const newBuyer = order.body.payment_source.paypal?.attributes;
+    const paymentSource = order.confirmedSource || order.body.payment_source;
+    const isCard = Boolean(paymentSource?.card);
+    const newBuyer = paymentSource?.[isCard ? "card" : "paypal"]?.attributes?.vault;
+    const vault = newBuyer ? {
+      status: vaultStatus,
+      ...(vaultStatus === "VAULTED" ? { id: `vault-${id}` } : {}),
+      customer: { id: `customer-${id}` },
+    } : undefined;
     return {
       id, status: "COMPLETED",
-      payment_source: order.body.payment_source.card ? { card: { brand: "VISA", last_digits: "1111" } } : { paypal: {
+      payment_source: isCard ? { card: { brand: "VISA", last_digits: "1111", expiry: "2030-12", attributes: { vault },
+        authentication_result: { liability_shift: "POSSIBLE", three_d_secure: { enrollment_status: "Y", authentication_status: mock.cardAuthenticationStatus } },
+      } } : { paypal: {
         email_address: `buyer-${id}@example.test`,
-        attributes: { vault: newBuyer ? {
-          status: vaultStatus,
-          ...(vaultStatus === "VAULTED" ? { id: `vault-${id}` } : {}),
-          customer: { id: `customer-${id}` },
-        } : undefined },
+        attributes: { vault },
       } },
       purchase_units: [{ payments: { captures: [{ id: `CAPTURE${id}`, status: mock.captureStatus, amount: { currency_code: "USD", value: "10.00" } }] } }],
     };
@@ -56,7 +62,7 @@ function harness() {
       let order = requestIds.get(requestId);
       if (!order) {
         const id = `ORDER${String(++serial).padStart(5, "0")}`;
-        const direct = Boolean(body.payment_source.paypal?.vault_id);
+        const direct = Boolean(body.payment_source?.paypal?.vault_id);
         order = { id, body, result: { id, status: "PAYER_ACTION_REQUIRED" } };
         if (direct) {
           mock.charges++;
@@ -68,13 +74,29 @@ function harness() {
       if (mock.loseCreateResponse) { mock.loseCreateResponse = false; throw new Error("response lost after processing"); }
       return Response.json(order.result, { status: 201, headers: { "paypal-debug-id": "create-debug-id" } });
     }
-    const match = path.match(/^\/v2\/checkout\/orders\/(ORDER\d+)(\/capture)?$/);
+    const match = path.match(/^\/v2\/checkout\/orders\/(ORDER\d+)(\/(?:capture|confirm-payment-source))?$/);
     assert.ok(match, `Unexpected PayPal request ${path}`);
     const order = orders.get(match[1]);
     assert.ok(order);
-    if (match[2]) {
+    if (match[2] === "/confirm-payment-source") {
+      order.confirmedSource = body.payment_source;
+      order.result = { id: order.id, status: "PAYER_ACTION_REQUIRED", links: [{
+        rel: "payer-action", method: "GET", href: mock.payerActionUrl || `https://www.sandbox.paypal.com/webapps/helios?flow=3ds&cart_id=${order.id}`,
+      }] };
+      if (mock.loseConfirmResponse) { mock.loseConfirmResponse = false; throw new Error("confirmation response lost"); }
+      return Response.json(order.result, { status: 200 });
+    }
+    if (match[2] === "/capture") {
       if (mock.failCapture) return Response.json({ name: "UNPROCESSABLE_ENTITY", message: "Payment declined", debug_id: "safe-debug-id" }, { status: 422 });
       order.result = completed(order, order.id);
+    }
+    const cardSource = order.confirmedSource?.card || order.body.payment_source?.card;
+    if (!match[2] && cardSource && !order.result.purchase_units && (!cardSource.vault_id || mock.savedCardApproved)) {
+      return Response.json({ id: order.id, status: "APPROVED", payment_source: { card: {
+        brand: "VISA", last_digits: "1111", authentication_result: {
+          liability_shift: "POSSIBLE", three_d_secure: { enrollment_status: "Y", authentication_status: mock.cardAuthenticationStatus },
+        },
+      } } });
     }
     return Response.json(order.result, { status: match[2] ? 201 : 200, headers: { "paypal-debug-id": "capture-debug-id" } });
   }
@@ -99,7 +121,7 @@ function harness() {
     return { status: response.status, headers: response.headers, body: value };
   }
   async function newCheckout(capture = true, key = crypto.randomUUID()) {
-    const created = await call("/api/orders", { flow: "new", requestId: key });
+    const created = await call("/api/orders", { flow: "new", savePaymentMethod: true, requestId: key });
     assert.equal(created.status, 200);
     const id = created.body.order.id;
     if (capture) assert.equal((await call(`/api/orders/${id}/capture`, {})).status, 200);
@@ -122,7 +144,7 @@ for (const page of ["new", "returning"]) {
     const request = h.calls.find((call) => call.path === "/v2/checkout/orders");
     assert.deepEqual(request.body.purchase_units, [{ amount: { currency_code: "USD", value: "10.00" } }]);
     assert.equal(request.body.payment_source.paypal, undefined);
-    assert.deepEqual(request.body.payment_source.card.attributes, { verification: { method: "SCA_WHEN_REQUIRED" } });
+    assert.deepEqual(request.body.payment_source.card.attributes, { verification: { method: "SCA_ALWAYS" } });
     assert.equal(request.body.payment_source.card.number, undefined);
     assert.equal(request.body.payment_source.card.security_code, undefined);
     assert.equal(request.body.payment_source.card.attributes.vault, undefined);
@@ -182,6 +204,167 @@ test("a declined card capture returns diagnostics and preserves the cached PayPa
   assert.equal(captured.status, 502);
   assert.equal(captured.body.details.traces.capture.response.status, 422);
   assert.deepEqual((await h.call("/api/state")).body.buyer, buyer);
+});
+
+async function saveCard(h) {
+  const created = await h.call("/api/orders", { flow: "card", page: "new", savePaymentMethod: true, requestId: crypto.randomUUID() });
+  assert.equal(created.status, 200);
+  const captured = await h.call(`/api/orders/${created.body.order.id}/capture`, {});
+  assert.equal(captured.status, 200);
+  return (await h.call("/api/state")).body.buyer;
+}
+
+for (const flow of ["new", "card"]) {
+  test(`${flow} purchases vault only with explicit consent and unsaved purchases keep the previous method`, async () => {
+    const h = harness();
+    await h.newCheckout();
+    const previous = (await h.call("/api/state")).body.buyer;
+    const input = { flow, page: "new", savePaymentMethod: false, requestId: crypto.randomUUID() };
+    const created = await h.call("/api/orders", input);
+    const payload = h.calls.filter((call) => call.path === "/v2/checkout/orders").at(-1).body;
+    const source = payload.payment_source[flow === "card" ? "card" : "paypal"];
+    assert.equal(source.attributes?.vault, undefined);
+    assert.equal((await h.call(`/api/orders/${created.body.order.id}/capture`, {})).status, 200);
+    assert.deepEqual((await h.call("/api/state")).body.buyer, previous);
+    const saving = await h.call("/api/orders", { ...input, savePaymentMethod: true, requestId: crypto.randomUUID() });
+    const savingPayload = h.calls.filter((call) => call.path === "/v2/checkout/orders").at(-1).body;
+    assert.equal(savingPayload.payment_source[flow === "card" ? "card" : "paypal"].attributes.vault.store_in_vault, "ON_SUCCESS");
+    await h.call(`/api/orders/${saving.body.order.id}/capture`, {});
+    const latest = (await h.call("/api/state")).body.buyer;
+    assert.equal(latest.methodType, flow === "card" ? "card" : "paypal");
+    assert.notEqual(latest.vaultId, previous.vaultId);
+    if (flow === "card") assert.deepEqual(latest.card, { brand: "VISA", lastDigits: "1111", expiry: "2030-12" });
+  });
+}
+
+test("save consent is frozen for retries and non-boolean consent is rejected", async () => {
+  const h = harness();
+  const input = { flow: "card", page: "new", savePaymentMethod: true, requestId: crypto.randomUUID() };
+  assert.equal((await h.call("/api/orders", input)).status, 200);
+  assert.equal((await h.call("/api/orders", { ...input, savePaymentMethod: false })).body.error, "IDEMPOTENCY_CONFLICT");
+  for (const choice of ["true", "false", 1, null]) {
+    assert.equal((await h.call("/api/orders", { ...input, requestId: crypto.randomUUID(), savePaymentMethod: choice })).body.error, "INVALID_SAVE_CHOICE");
+  }
+});
+
+test("saved cards use separate create/confirm calls with SCA_ALWAYS and capture only after successful authentication", async () => {
+  const h = harness();
+  const saved = await saveCard(h);
+  const input = { flow: "saved-card", requestId: crypto.randomUUID(), vaultRevision: saved.revision, vault_id: "untrusted-browser-token" };
+  const created = await h.call("/api/orders", input);
+  assert.equal(created.status, 200);
+  assert.equal(created.body.order.status, "PAYER_ACTION_REQUIRED");
+  assert.match(created.body.order.payerActionUrl, /^https:\/\/www\.sandbox\.paypal\.com\//);
+  assert.equal(new URL(created.body.order.payerActionUrl).searchParams.get("redirect_uri"), "https://test.example/returning-customer?saved-card=return");
+  assert.equal(created.body.traces.create.request.body.payment_source, undefined);
+  const source = created.body.traces.confirm.request.body.payment_source.card;
+  assert.equal(source.vault_id, saved.vaultId);
+  assert.equal(source.attributes.verification.method, "SCA_ALWAYS");
+  assert.deepEqual(source.stored_credential, { payment_initiator: "CUSTOMER", payment_type: "ONE_TIME", usage: "SUBSEQUENT" });
+  const before = h.calls.filter((call) => call.path.endsWith("/capture")).length;
+  assert.equal((await h.call(`/api/orders/${created.body.order.id}/capture`, { cardAuthenticated: true })).body.error, "CARD_AUTHENTICATION_REQUIRED");
+  assert.equal(h.calls.filter((call) => call.path.endsWith("/capture")).length, before);
+  h.mock.savedCardApproved = true;
+  const status = await h.call(`/api/orders/${created.body.order.id}`);
+  assert.equal(status.body.order.cardAuthenticated, true);
+  const captured = await h.call(`/api/orders/${created.body.order.id}/capture`, {});
+  assert.equal(captured.body.order.completed, true);
+  assert.deepEqual((await h.call("/api/state")).body.buyer, saved);
+});
+
+test("card captures reject failed, incomplete, attempted-only, or absent 3DS results", async () => {
+  const h = harness();
+  const created = await h.call("/api/orders", { flow: "card", page: "new", requestId: crypto.randomUUID() });
+  for (const status of ["N", "R", "U", "C", "A", undefined]) {
+    h.mock.cardAuthenticationStatus = status;
+    const result = await h.call(`/api/orders/${created.body.order.id}/capture`, { authentication_status: "Y" });
+    assert.equal(result.body.error, "CARD_AUTHENTICATION_REQUIRED");
+  }
+  assert.equal(h.calls.some((call) => call.path.endsWith("/capture")), false);
+  h.mock.cardAuthenticationStatus = "Y";
+  assert.equal((await h.call(`/api/orders/${created.body.order.id}/capture`, {})).body.order.completed, true);
+});
+
+test("saved-card confirmation retries reuse the same order and idempotency key after a lost response", async () => {
+  const h = harness();
+  const saved = await saveCard(h);
+  const input = { flow: "saved-card", requestId: crypto.randomUUID(), vaultRevision: saved.revision };
+  h.mock.loseConfirmResponse = true;
+  assert.equal((await h.call("/api/orders", input)).status, 502);
+  h.restart();
+  const restored = await h.call("/api/orders", input);
+  assert.equal(restored.status, 200);
+  const confirms = h.calls.filter((call) => call.path.endsWith("/confirm-payment-source"));
+  assert.equal(confirms.length, 2);
+  assert.equal(confirms[0].path, confirms[1].path);
+  assert.equal(confirms[0].headers["PayPal-Request-Id"], confirms[1].headers["PayPal-Request-Id"]);
+  assert.deepEqual(confirms[0].body, confirms[1].body);
+});
+
+test("saved method types cannot be interchanged and stale saved-card captures are rejected", async () => {
+  const h = harness();
+  const card = await saveCard(h);
+  for (const path of ["/api/client-token", "/api/direct-charge"]) {
+    const result = await h.call(path, { requestId: crypto.randomUUID(), vaultRevision: card.revision });
+    assert.equal(result.status, 409);
+  }
+  const created = await h.call("/api/orders", { flow: "saved-card", requestId: crypto.randomUUID(), vaultRevision: card.revision });
+  await h.newCheckout();
+  h.mock.savedCardApproved = true;
+  const original = h.calls.find((call) => call.path.endsWith("/confirm-payment-source"));
+  assert.equal((await h.call("/api/orders", { flow: "saved-card", requestId: original.headers["PayPal-Request-Id"].slice(8), vaultRevision: card.revision })).body.error, "BUYER_CHANGED");
+  assert.equal((await h.call(`/api/orders/${created.body.order.id}/capture`, {})).body.error, "BUYER_CHANGED");
+  const paypal = (await h.call("/api/state")).body.buyer;
+  assert.equal((await h.call("/api/orders", { flow: "saved-card", requestId: crypto.randomUUID(), vaultRevision: paypal.revision })).body.error, "PAYMENT_METHOD_CHANGED");
+});
+
+test("unsafe payer-action links are excluded from the saved-card redirect response", async () => {
+  const h = harness();
+  const saved = await saveCard(h);
+  for (const url of ["javascript:alert(1)", "https://www.sandbox.paypal.com.evil.example/", "http://www.sandbox.paypal.com/"]) {
+    h.mock.payerActionUrl = url;
+    const result = await h.call("/api/orders", { flow: "saved-card", requestId: crypto.randomUUID(), vaultRevision: saved.revision });
+    assert.equal(result.body.order.payerActionUrl, undefined);
+  }
+});
+
+test("a PayPal purchase offered beside a saved card does not replace the saved card", async () => {
+  const h = harness();
+  const saved = await saveCard(h);
+  const created = await h.call("/api/orders", { flow: "paypal", page: "returning", requestId: crypto.randomUUID() });
+  assert.equal(created.status, 200);
+  assert.equal((await h.call(`/api/orders/${created.body.order.id}/capture`, {})).body.order.completed, true);
+  assert.deepEqual((await h.call("/api/state")).body.buyer, saved);
+});
+
+test("pending card vaulting resolves only from a verified matching card token event", async () => {
+  const h = harness();
+  await h.newCheckout();
+  h.env.PAYPAL_WEBHOOK_ID = "configured-webhook-id";
+  h.mock.vaultStatus = "APPROVED";
+  const pending = await saveCard(h);
+  assert.equal(pending.state, "PENDING");
+  assert.equal(pending.methodType, "card");
+  assert.equal(pending.vaultId, null);
+  const headers = { Authorization: "", "paypal-auth-algo": "SHA256withRSA", "paypal-cert-url": "https://api.paypal.com/cert", "paypal-transmission-id": "card-vault-event", "paypal-transmission-sig": "signature", "paypal-transmission-time": new Date().toISOString() };
+  const event = { create_time: new Date().toISOString(), event_type: "VAULT.PAYMENT-TOKEN.CREATED", resource: { id: "late-card-vault", customer: { id: pending.customerId } } };
+  await h.call("/api/paypal/webhook", event, { headers });
+  assert.equal((await h.call("/api/state")).body.buyer.vaultId, null);
+  await h.call("/api/paypal/webhook", { ...event, resource: { ...event.resource, payment_source: { paypal: {} } } }, { headers });
+  assert.equal((await h.call("/api/state")).body.buyer.vaultId, null);
+  await h.call("/api/paypal/webhook", { ...event, resource: { ...event.resource, payment_source: { card: { brand: "VISA", last_digits: "1111" } } } }, { headers });
+  const saved = (await h.call("/api/state")).body.buyer;
+  assert.equal(saved.state, "VAULTED");
+  assert.equal(saved.methodType, "card");
+  assert.equal(saved.vaultId, "late-card-vault");
+});
+
+test("late PayPal captures cannot replace a more recent opted-in card purchase", async () => {
+  const h = harness();
+  const earlyPayPal = await h.newCheckout(false);
+  const saved = await saveCard(h);
+  await h.call(`/api/orders/${earlyPayPal}/capture`, {});
+  assert.deepEqual((await h.call("/api/state")).body.buyer, saved);
 });
 
 test("basic authentication protects pages, assets, and APIs, including failures", async () => {

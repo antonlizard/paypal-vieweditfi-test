@@ -13,7 +13,7 @@
     <header class="topbar"><a class="brand" href="/new-customer"><span class="brand-mark">E</span><span>EditFI <span class="muted">test lab</span></span></a><span class="badge"><span class="dot"></span>PayPal sandbox</span></header>
     <nav class="flow-nav" aria-label="Checkout flows"><a href="/new-customer"><span class="step">1</span> New customer</a><a href="/returning-customer" aria-current="page"><span class="step">2</span> Returning customer</a></nav>
     <main>
-      <div class="page-heading"><p class="eyebrow">VIEW, EDIT &amp; PAY</p><h1>Welcome back.<br>Your payment method is saved.</h1><p>Review the latest saved buyer. Edit the payment method with PayPal, or place the order using the saved method.</p></div>
+      <div class="page-heading"><p class="eyebrow">VIEW, EDIT &amp; PAY</p><h1>Welcome back.<br>Your payment method is saved.</h1><p>Pay with your latest saved method, or choose another payment option. Saved cards require 3D Secure authentication.</p></div>
       <div class="grid">
         <section class="card checkout" aria-labelledby="checkout-title">
           <div class="section-label"><span>FLOW 02</span><span>RETURNING CUSTOMER</span></div>
@@ -21,9 +21,10 @@
           <div class="product"><span class="product-icon" aria-hidden="true">↗</span><div><strong>EditFI test item</strong><p>One sandbox purchase</p></div><strong class="amount" data-amount>—</strong></div>
           <div class="total"><span>Total</span><strong data-amount>—</strong></div>
           <div id="empty-state" class="empty-state" hidden><span class="empty-icon" aria-hidden="true">◇</span><h3>No saved buyer yet</h3><p>Complete the new-customer flow to create a saved payment method.</p><a class="button primary" href="/new-customer">Start a new-customer checkout →</a></div>
-          <div id="checkout-controls" hidden><p class="payment-label">Your saved payment method</p><div id="saved-payment-methods-container" class="sdk-container saved-method"></div><p class="component-note">Edit and approve the payment method in PayPal, then place your order below.</p><button id="place-order" class="button primary" disabled>Place order with saved method</button><p class="component-note">Payment is captured only when you click this button.</p></div>
+          <div id="checkout-controls" hidden><p class="payment-label">Your saved payment method</p><div id="saved-card-method" class="saved-card-method" hidden><strong id="saved-card-description">Saved card</strong><p id="saved-card-expiry" class="supporting"></p></div><div id="saved-payment-methods-container" class="sdk-container saved-method"></div><p id="saved-method-note" class="component-note">Edit and approve the payment method in PayPal, then place your order below.</p><button id="place-order" class="button primary" disabled>Place order with saved method</button><p id="saved-method-capture-note" class="component-note">Payment is captured only when you click this button.</p></div>
           <div id="alternative-controls" class="alternative-payments">
             <p class="payment-label">Other payment methods</p>
+            <details id="other-paypal-option" class="payment-option" hidden><summary><span>PayPal</span><span class="method-badge">Sandbox</span></summary><p class="supporting">Pay with a PayPal account for this purchase.</p><div id="other-paypal-buttons" class="sdk-container"></div></details>
             <details id="card-option" class="payment-option">
               <summary><span>Credit or debit card</span><span class="method-badge">Sandbox</span></summary>
               <p id="card-status" class="supporting" role="status">Loading secure card fields…</p>
@@ -38,7 +39,7 @@
                   <div class="card-field-row"><label>State / region (optional)<input id="billing-region" autocomplete="billing address-level1" maxlength="120"></label><label>Country code<input id="billing-country" autocomplete="billing country" value="DE" required pattern="[A-Za-z]{2}" maxlength="2" title="Two-letter country code, for example DE or US"></label></div>
                 </fieldset>
                 <button id="card-submit" class="button primary" type="submit" disabled>Pay by card <span data-amount>—</span></button>
-                <p class="component-note">PayPal securely collects your card details. This card payment does not change the saved PayPal buyer.</p>
+                <p class="component-note">PayPal securely collects your card details. Using a different card here preserves your saved payment method.</p>
               </form>
             </details>
             <button id="wallet-option" class="button wallet-placeholder" type="button" disabled aria-describedby="wallet-note"><span id="wallet-label">Digital wallet</span><span class="method-badge">Display only</span></button>
@@ -54,15 +55,17 @@
           </section>
           <button id="check-status" class="button secondary" hidden>Check payment status</button>
           <button id="resume-card" class="button secondary" hidden>Complete approved card payment</button>
+          <button id="authenticate-saved-card" class="button secondary" hidden>Continue card authentication</button>
           <div id="success-actions" hidden><button id="another-checkout" class="button primary">Start another returning-customer purchase →</button><a class="text-button" href="/new-customer">Test with a different buyer</a></div>
-          <p class="fine-print">This page uses the latest saved vault ID from the new-customer checkout.</p>
+          <p class="fine-print">This page offers the latest PayPal account or card saved with a new-customer purchase.</p>
         </section>
-        <aside class="card vault-card" aria-labelledby="vault-title"><div class="section-label"><span>SHARED BETWEEN BOTH PAGES</span><span class="mini-icon" aria-hidden="true">◇</span></div><h2 id="vault-title">Saved buyer</h2><span id="vault-state" class="state-chip">Checking</span><p id="vault-message" class="supporting">Reading the saved payment method.</p><dl class="vault-details"><dt>Vault ID</dt><dd id="vault-id">—</dd><dt>PayPal customer ID</dt><dd id="customer-id">—</dd><dt>Buyer</dt><dd id="buyer-email">—</dd><dt>Saved at</dt><dd id="saved-at">—</dd></dl><button id="refresh-vault" class="text-button">Refresh saved buyer</button><div class="aside-note">The saved vault ID is reused for every returning-customer purchase until a new buyer replaces it.</div></aside>
+        <aside class="card vault-card" aria-labelledby="vault-title"><div class="section-label"><span>SHARED BETWEEN BOTH PAGES</span><span class="mini-icon" aria-hidden="true">◇</span></div><h2 id="vault-title">Saved payment method</h2><span id="vault-state" class="state-chip">Checking</span><p id="vault-message" class="supporting">Reading the saved payment method.</p><dl class="vault-details"><dt>Payment method</dt><dd id="saved-method-type">—</dd><dt>Vault ID</dt><dd id="vault-id">—</dd><dt>Customer ID</dt><dd id="customer-id">—</dd><dt id="buyer-detail-label">Buyer</dt><dd id="buyer-email">—</dd><dt>Saved at</dt><dd id="saved-at">—</dd></dl><button id="refresh-vault" class="text-button">Refresh saved method</button><div class="aside-note">The latest saved PayPal account or card is reused until another purchase saves a replacement.</div></aside>
       </div>
       <section class="card api-traces" aria-labelledby="api-traces-title">
         <h2 id="api-traces-title">PayPal API requests and responses</h2>
         <p class="supporting">Backend REST requests and full PayPal responses for this checkout. New requests show the authorization method and exact Bearer token used. Token values are kept only in this page; client secrets and passwords remain hidden.</p>
         <details id="create-trace"><summary><span>Create order</span><span id="create-trace-status" class="muted small">Not requested</span></summary><div class="trace-columns"><div><h3>Request</h3><pre id="create-request">No request recorded yet.</pre></div><div><h3>Response</h3><pre id="create-response">No response recorded yet.</pre></div></div></details>
+        <details id="confirm-trace"><summary><span>Confirm saved card / 3DS</span><span id="confirm-trace-status" class="muted small">Not requested</span></summary><div class="trace-columns"><div><h3>Request</h3><pre id="confirm-request">No request recorded yet.</pre></div><div><h3>Response</h3><pre id="confirm-response">No response recorded yet.</pre></div></div></details>
         <details id="capture-trace"><summary><span>Capture</span><span id="capture-trace-status" class="muted small">Not requested</span></summary><div class="trace-columns"><div><h3>Request</h3><pre id="capture-request">No request recorded yet.</pre></div><div><h3>Response</h3><pre id="capture-response">No response recorded yet.</pre></div></div></details>
       </section>
       <details class="card diagnostics"><summary><span>Integration activity</span><span class="muted small">SavedPaymentMethods · JS SDK v5</span></summary><p class="supporting">API results and component events for this checkout. Credentials and SDK tokens are omitted.</p><pre id="activity" aria-live="polite">Waiting for configuration…</pre></details>
