@@ -282,10 +282,33 @@ test("card captures reject failed, incomplete, attempted-only, or absent 3DS res
     h.mock.cardAuthenticationStatus = status;
     const result = await h.call(`/api/orders/${created.body.order.id}/capture`, { authentication_status: "Y" });
     assert.equal(result.body.error, "CARD_AUTHENTICATION_REQUIRED");
+    assert.equal(result.body.details.traces.get.request.method, "GET");
+    assert.equal(result.body.details.traces.get.request.url.endsWith("?fields=payment_source"), true);
+    assert.equal(result.body.details.traces.get.response.body.payment_source.card.authentication_result.three_d_secure.authentication_status, status);
+    assert.equal(JSON.stringify(result.body).includes("server-access-token"), false);
   }
   assert.equal(h.calls.some((call) => call.path.endsWith("/capture")), false);
   h.mock.cardAuthenticationStatus = "Y";
-  assert.equal((await h.call(`/api/orders/${created.body.order.id}/capture`, {})).body.order.completed, true);
+  const captured = await h.call(`/api/orders/${created.body.order.id}/capture`, {});
+  assert.equal(captured.body.order.completed, true);
+  assert.equal(captured.body.traces.get.response.body.payment_source.card.authentication_result.three_d_secure.authentication_status, "Y");
+});
+
+test("Get Order details retain a redacted request and authentication result without capturing", async () => {
+  const h = harness();
+  const requestId = crypto.randomUUID();
+  const created = await h.call("/api/orders", { flow: "card", page: "new", requestId });
+  const result = await h.call(`/api/orders/${created.body.order.id}`);
+  assert.equal(result.body.traces.get.response.status, 200);
+  assert.equal(result.body.traces.get.request.method, "GET");
+  assert.equal(result.body.traces.get.request.headers.Authorization, "[REDACTED]");
+  assert.equal(result.body.traces.get.response.body.payment_source.card.authentication_result.three_d_secure.authentication_status, "Y");
+  assert.deepEqual(result.body.traces.create, created.body.traces.create);
+  assert.equal(h.calls.some((call) => call.path.endsWith("/capture")), false);
+  h.restart();
+  const restored = await h.call(`/api/operations/${requestId}`);
+  assert.deepEqual(restored.body.traces.get, result.body.traces.get);
+  assert.equal(JSON.stringify(result.body).includes("server-access-token"), false);
 });
 
 test("saved-card confirmation retries reuse the same order and idempotency key after a lost response", async () => {
@@ -480,11 +503,14 @@ test("Orders traces preserve the actual REST requests and full responses across 
   assert.equal(recovered.body.traces.capture.request.authentication.token, "[REDACTED]");
   assert.equal(recovered.body.traces.capture.request.headers.Authorization, "[REDACTED]");
   assert.deepEqual(recovered.body.traces.capture.response, capture.response);
-  await h.call(`/api/orders/${id}`);
+  const checked = await h.call(`/api/orders/${id}`);
   const before = h.calls.length;
   const replay = await h.call(`/api/orders/${id}/capture`, {});
   assert.equal(h.calls.length, before);
-  assert.deepEqual(replay.body.traces, recovered.body.traces);
+  assert.deepEqual(replay.body.traces, checked.body.traces);
+  assert.equal(checked.body.traces.get.request.method, "GET");
+  assert.equal(checked.body.traces.get.response.status, 200);
+  assert.deepEqual(replay.body.traces.capture, recovered.body.traces.capture);
   const serialized = JSON.stringify(captured.body.traces);
   for (const secret of [h.env.PAYPAL_CLIENT_SECRET, h.env.BASIC_AUTH_PASSWORD]) assert.equal(serialized.includes(secret), false);
   assert.equal(JSON.stringify(created.body).includes("server-access-token"), false);

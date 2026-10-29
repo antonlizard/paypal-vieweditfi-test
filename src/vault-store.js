@@ -308,7 +308,7 @@ export class VaultStore {
     if (capture && ["card", "saved-card"].includes(operation.flow)) {
       // Read authentication from PayPal, never from browser callbacks. This
       // test harness requires a successful 3DS result before a card capture.
-      const verified = await this.paypal.api(`${path}?fields=payment_source`);
+      const { order: verified } = await this.paymentRequest(operation, "get", `${path}?fields=payment_source`, { method: "GET" });
       if (isCompleted(verified)) {
         operation.result = summary(verified, operation);
         await this.finish(operation, verified);
@@ -325,7 +325,8 @@ export class VaultStore {
     const captured = capture ? await this.paymentRequest(operation, "capture", `${path}/capture`, {
       method: "POST", body: {}, requestId: `capture-${orderId}`,
     }) : null;
-    const order = captured ? captured.order : await this.paypal.api(["card", "saved-card"].includes(operation.flow) ? `${path}?fields=payment_source` : path);
+    const order = captured ? captured.order : (await this.paymentRequest(operation, "get",
+      ["card", "saved-card"].includes(operation.flow) ? `${path}?fields=payment_source` : path, { method: "GET" })).order;
     operation.result = summary(order, operation);
     await this.finish(operation, order);
     return json({

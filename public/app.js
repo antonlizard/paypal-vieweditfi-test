@@ -5,6 +5,8 @@ let cardFields, cardMounted = false, cardRendering, cardSubmitting = false, card
 let savePayPalChoice = false, saveCardChoice = false, savedCardAuthenticationUrl;
 let selectedMethod, renderNewPayPalButton, renderCardFields;
 let cardStage = "idle", cardCancelled = false;
+let cardSession, cardFieldElements = [], cardInterrupted = false;
+let cardCaptureAttempted = false;
 const activity = [];
 const backendErrors = new WeakSet();
 const context = () => flow === "new" ? "new" : `returning:${buyer?.revision}`;
@@ -16,7 +18,7 @@ const cardLabel = (value) => `${value?.brand || "Card"} •••• ${value?.la
 
 function log(event, data) {
   activity.unshift({ time: new Date().toLocaleTimeString(), event, ...(data ? { data } : {}) });
-  $("activity").textContent = activity.slice(0, 12).map((entry) => JSON.stringify(entry, null, 2)).join("\n\n");
+  $("activity").textContent = activity.slice(0, 30).map((entry) => JSON.stringify(entry, null, 2)).join("\n\n");
 }
 
 function status(message, type = "") {
@@ -25,7 +27,7 @@ function status(message, type = "") {
 }
 
 function resetApiTraces() {
-  for (const kind of ["create", "confirm", "capture"]) {
+  for (const kind of ["create", "confirm", "get", "capture"]) {
     $(`${kind}-trace`).open = false;
     $(`${kind}-trace-status`).textContent = "Not requested";
     $(`${kind}-request`).textContent = "No request recorded yet.";
@@ -34,7 +36,7 @@ function resetApiTraces() {
 }
 
 function showApiTraces(traces) {
-  for (const kind of ["create", "confirm", "capture"]) {
+  for (const kind of ["create", "confirm", "get", "capture"]) {
     const trace = traces[kind];
     if (!trace) continue;
     $(`${kind}-trace`).open = true;
@@ -47,6 +49,13 @@ function showApiTraces(traces) {
     }
     $(`${kind}-request`).textContent = JSON.stringify(request, null, 2);
     $(`${kind}-response`).textContent = JSON.stringify(trace.response || { error: trace.error || "No response received." }, null, 2);
+    if (kind === "get" && trace.response?.body?.payment_source?.card) {
+      log("Backend Get Order 3DS result", {
+        source: "backend", orderID: trace.response.body.id, status: trace.response.body.status,
+        authentication_result: cardAuthenticationResult(trace.response.body.payment_source.card.authentication_result),
+        debugId: trace.response.headers?.["paypal-debug-id"],
+      });
+    }
   }
   if (traces.create?.request?.body?.payment_source?.paypal?.vault_id && !traces.capture) {
     $("capture-trace-status").textContent = "No separate call";
@@ -56,17 +65,19 @@ function showApiTraces(traces) {
 }
 
 function controls() {
-  const locked = busy || paid || unresolved || cardSubmitting;
+  const processing = busy || submittingPayment || cardSubmitting;
+  const locked = processing || paid || unresolved;
   if (flow === "new") {
-    $("payment-methods").disabled = locked;
+    $("payment-methods").disabled = processing || paid;
     $("payment-methods").hidden = paid;
   }
   const container = $("checkout-controls");
   container.inert = locked;
   if ($("place-order")) $("place-order").disabled = locked || !mounted;
-  // Keep hosted fields interactive during their own submission so a 3DS
-  // authentication challenge inside a PayPal iframe remains usable.
-  $("alternative-controls").inert = locked && !cardSubmitting;
+  // Keep card fields editable even while a payment result needs checking.
+  // Only payment submission is blocked when a capture result is uncertain.
+  $("alternative-controls").inert = paid;
+  if ($("other-paypal-option")) $("other-paypal-option").inert = locked;
   $("card-submit").disabled = locked || !cardMounted;
   $("resume-card").hidden = paid || !approvedCardOrderId;
   $("resume-card").disabled = busy || submittingPayment || cardSubmitting;
@@ -75,7 +86,7 @@ function controls() {
     $("authenticate-saved-card").disabled = busy || submittingPayment;
   }
   for (const id of ["save-paypal", "save-card"]) if ($(id)) $(id).disabled = locked;
-  $("check-status").hidden = !unresolved;
+  $("check-status").hidden = paid || (!unresolved && !cardInterrupted);
   $("success-actions").hidden = !paid;
   if (paid) {
     container.hidden = true;
@@ -198,6 +209,8 @@ async function createOrder() {
   }
   busy = true;
   activeMethod = "paypal";
+  cardInterrupted = false;
+  cardCaptureAttempted = false;
   sessionStorage.removeItem(storageKey("card"));
   cardOrderId = approvedCardOrderId = undefined;
   lastOrderId = undefined;
@@ -237,6 +250,7 @@ async function onApprove(data) {
 
 async function captureOrder(orderID) {
   if (activeMethod.includes("card")) {
+    cardCaptureAttempted = true;
     approvedCardOrderId = undefined;
     savedCardAuthenticationUrl = undefined;
   }
@@ -252,11 +266,13 @@ async function captureOrder(orderID) {
     // An interrupted capture might still have settled at PayPal. Block another
     // purchase and offer status recovery instead of creating a second charge.
     unresolved = !paid && error.code !== "BUYER_CHANGED";
+    if (error.code === "CARD_AUTHENTICATION_REQUIRED") cardCaptureAttempted = false;
     showError(error);
     if (error.code === "BUYER_CHANGED") $("checkout-controls").hidden = true;
     throw error;
   } finally {
     submittingPayment = false;
+    controls();
   }
 }
 
@@ -426,7 +442,7 @@ async function selectPaymentMethod(method) {
 if (flow === "new") {
   for (const method of ["paypal", "card", "wallet"]) {
     $(`method-${method}`).addEventListener("change", async () => {
-      if (busy || paid || unresolved || submittingPayment || cardSubmitting) {
+      if (busy || paid || submittingPayment || cardSubmitting) {
         // Restore the selected radio if a late event arrives during payment.
         for (const value of ["paypal", "card", "wallet"]) $(`method-${value}`).checked = value === selectedMethod;
         return;
@@ -444,6 +460,28 @@ function configureWalletPlaceholder() {
   if (flow === "new") $("wallet-choice-label").textContent = wallet;
   $("wallet-option").disabled = true;
   $("wallet-note").textContent = `${wallet} is a display-only option. No wallet payment will be started.`;
+}
+
+function cardAuthenticationResult(value) {
+  if (!value || typeof value !== "object") return null;
+  const result = {};
+  if (["POSSIBLE", "NO", "UNKNOWN"].includes(value.liability_shift)) result.liability_shift = value.liability_shift;
+  const secure = value.three_d_secure;
+  if (secure && typeof secure === "object") {
+    result.three_d_secure = {};
+    if (/^[YNURACDI]$/.test(secure.authentication_status || "")) result.three_d_secure.authentication_status = secure.authentication_status;
+    if (/^[YNU]$/.test(secure.enrollment_status || "")) result.three_d_secure.enrollment_status = secure.enrollment_status;
+  }
+  return Object.keys(result).length ? result : null;
+}
+
+function frontendCardResult(data) {
+  return {
+    liabilityShift: ["POSSIBLE", "NO", "UNKNOWN"].includes(data?.liabilityShift) ? data.liabilityShift : null,
+    authentication_result: cardAuthenticationResult(data?.authentication_result || data?.payment_source?.card?.authentication_result),
+    ...(typeof data?.liabilityShifted === "boolean" ? { liabilityShifted: data.liabilityShifted } : {}),
+    ...(typeof data?.liabilityShiftPossible === "boolean" ? { liabilityShiftPossible: data.liabilityShiftPossible } : {}),
+  };
 }
 
 function cardSdkDiagnostic(error) {
@@ -465,6 +503,8 @@ function cardSdkDiagnostic(error) {
   const diagnostic = {};
   const issues = new Set();
   for (const node of nodes) {
+    if (["POSSIBLE", "NO", "UNKNOWN"].includes(node?.liabilityShift)) diagnostic.liabilityShift ||= node.liabilityShift;
+    diagnostic.authentication_result ||= cardAuthenticationResult(node?.authentication_result || node?.payment_source?.card?.authentication_result);
     diagnostic.sdkCode ||= code(node?.code);
     diagnostic.sdkName ||= code(node?.name);
     const debugId = node?.debug_id || node?.debugId;
@@ -485,77 +525,105 @@ function cardSdkDiagnostic(error) {
   return diagnostic;
 }
 
-function cardError(error, callback = "sdk-onError") {
+function resetInterruptedCard(session, captureUncertain) {
+  if (session !== cardSession) return;
+  session.interrupted = true;
+  cardSession = undefined; // Old SDK callbacks and submit promises lose ownership.
+  cardInterrupted = Boolean(cardOrderId);
+  busy = submittingPayment = cardSubmitting = false;
+  unresolved = captureUncertain;
+  approvedCardOrderId = undefined;
+  cardMounted = false;
+  cardRendering = renderCardFields = undefined;
+  const fields = cardFieldElements;
+  cardFieldElements = [];
+  // Rebuild disabled/aborted SDK iframes. Individual fields expose close();
+  // CardFields itself does not expose a public destroy/reset method in v5.
+  // A broken SDK promise must not keep the merchant checkout waiting.
+  for (const field of fields) Promise.resolve().then(() => field.close()).catch(() => {});
+  for (const id of ["card-name-field", "card-number-field", "card-expiry-field", "card-cvv-field"]) $(id).replaceChildren();
+  initializeCardFields(window.paypal);
+  controls();
+}
+
+function cardError(error, callback = "sdk-onError", session = cardSession) {
   if (paid) return;
-  if (cardCancelled) return; // A later rejection must not hide cancellation.
-  busy = false;
-  unresolved = Boolean(cardOrderId) && !paid;
+  const ignored = !session || session !== cardSession || session.interrupted;
   const safe = error && typeof error === "object" && backendErrors.has(error) ? error : new Error(
-    cardOrderId ? "Card submission was interrupted. Check payment status before trying again." :
+    session?.orderID ? "Card submission was interrupted. You can edit the card or choose another method. Check payment status for the 3DS result." :
       "Card payment could not be submitted. Review the card fields, then retry.",
   );
   if (safe !== error) {
     safe.code = "CARD_SDK_ERROR";
-    safe.details = { orderID: cardOrderId, stage: cardStage, callback, ...cardSdkDiagnostic(error) };
+    safe.details = { orderID: session?.orderID, stage: session?.stage || cardStage, callback, ...cardSdkDiagnostic(error) };
   }
+  log("CardFields error 3DS result", { source: "frontend", callback, orderID: session?.orderID, ignored, ...cardSdkDiagnostic(error) });
+  if (ignored || cardCancelled) return;
+  const captureUncertain = session.stage === "capture" && safe.code !== "CARD_AUTHENTICATION_REQUIRED";
+  if (captureUncertain && safe.code === "CARD_SDK_ERROR") safe.message = "The capture result is uncertain. Check payment status before submitting another payment. You can still edit or switch methods.";
   showError(safe);
+  resetInterruptedCard(session, captureUncertain);
 }
 
-function onCardCancel() {
-  if (paid || cardStage === "capture") return;
+function onCardCancel(session) {
+  const ignored = paid || session !== cardSession || session.interrupted || session.stage === "capture";
+  log("CardFields.onCancel 3DS result", { source: "frontend", orderID: session.orderID, result: "CANCELLED_OR_CLOSED", ignored });
+  if (ignored) return;
   cardCancelled = true;
-  busy = false;
-  unresolved = Boolean(cardOrderId);
-  status("3D Secure verification was cancelled or closed. Check payment status before trying again.", "error");
-  log("Card 3DS cancelled or closed", { orderID: cardOrderId, stage: cardStage });
-  controls();
+  status("3D Secure verification was cancelled or closed. You can edit the card or choose another payment method.", "error");
+  resetInterruptedCard(session, false);
 }
 
-async function createCardOrder() {
-  if (!cardSubmitting || paid || unresolved) throw new Error("Submit the card form to start this payment.");
-  cardStage = "create-order";
+async function createCardOrder(session) {
+  if (session !== cardSession || session.interrupted || !cardSubmitting || paid || unresolved) throw new Error("Submit the card form to start this payment.");
+  cardStage = session.stage = "create-order";
   const result = await api("/api/orders", { flow: "card", page: flow, requestId: requestId("card"), ...(flow === "new" ? { savePaymentMethod: saveCardChoice } : {}) });
-  cardOrderId = lastOrderId = result.order.id;
+  session.orderID = result.order.id;
+  if (session !== cardSession || session.interrupted) throw new Error("This card attempt was interrupted.");
+  cardOrderId = lastOrderId = session.orderID;
   showPaymentDetails(result.order);
   log("Card order created", { orderID: cardOrderId });
-  cardStage = "authentication";
+  cardStage = session.stage = "authentication";
   return cardOrderId;
 }
 
 function initializeCardFields(paypal) {
   try {
     if (typeof paypal.CardFields !== "function") throw new Error("Card Fields is not available in this SDK.");
+    const session = cardSession = { stage: "idle", interrupted: false };
+    cardCancelled = false;
     cardFields = paypal.CardFields({
-      createOrder: createCardOrder,
+      createOrder: () => createCardOrder(session),
       onApprove(data) {
-        if (paid || unresolved || cardCancelled) return;
-        if (!cardSubmitting || data.orderID !== cardOrderId) throw new Error("Unexpected card order approval.");
+        const ignored = paid || session !== cardSession || session.interrupted || unresolved || cardCancelled ||
+          activeMethod !== "card" || !cardSubmitting || data.orderID !== session.orderID;
+        log("CardFields.onApprove 3DS result", { source: "frontend", orderID: session.orderID, ignored, ...frontendCardResult(data) });
+        if (ignored) return;
         if (!cardCapturePromise) {
-          cardStage = "capture";
-          log("Card SDK approved; requesting backend verification and capture", {
-            orderID: data.orderID,
-            ...(["POSSIBLE", "NO", "UNKNOWN"].includes(data.liabilityShift) ? { liabilityShift: data.liabilityShift } : {}),
-          });
+          cardStage = session.stage = "capture";
           approvedCardOrderId = data.orderID;
           cardCapturePromise = captureOrder(data.orderID).finally(() => { cardCapturePromise = undefined; });
         }
         return cardCapturePromise;
       },
-      onError: (error) => cardError(error, "sdk-onError"),
-      onCancel: onCardCancel,
+      onError: (error) => cardError(error, "sdk-onError", session),
+      onCancel: () => onCardCancel(session),
       style: { input: { "font-family": "Arial, sans-serif", "font-size": "15px", color: "#152544", padding: "12px" }, ".invalid": { color: "#a64237" } },
     });
     if (!cardFields.isEligible()) throw new Error("This Sandbox REST app is not eligible for Card Fields.");
+    log("CardFields v5 3DS callback availability", { onApprove: true, onError: true, onCancel: true,
+      onLookupComplete: false, note: "onLookupComplete belongs to Braintree 3DS and is not exposed by PayPal CardFields v5." });
     $("card-status").textContent = "Pay securely with a sandbox credit or debit card.";
     $("card-form").hidden = false;
     const render = () => {
       if ((flow === "new" ? selectedMethod !== "card" : !$("card-option").open) || cardRendering) return cardRendering;
-      cardRendering = Promise.resolve().then(() => Promise.all([
-        cardFields.NameField({ ariaLabel: "Cardholder name" }).render("#card-name-field"),
-        cardFields.NumberField({ ariaLabel: "Card number" }).render("#card-number-field"),
-        cardFields.ExpiryField({ ariaLabel: "Expiry date" }).render("#card-expiry-field"),
-        cardFields.CVVField({ ariaLabel: "Security code" }).render("#card-cvv-field"),
-      ])).then(() => { cardMounted = true; controls(); }).catch(() => {
+      const fields = [cardFields.NameField({ ariaLabel: "Cardholder name" }), cardFields.NumberField({ ariaLabel: "Card number" }),
+        cardFields.ExpiryField({ ariaLabel: "Expiry date" }), cardFields.CVVField({ ariaLabel: "Security code" })];
+      cardFieldElements = fields;
+      cardRendering = Promise.resolve().then(() => Promise.all(fields.map((field, index) =>
+        field.render(["#card-name-field", "#card-number-field", "#card-expiry-field", "#card-cvv-field"][index]))))
+        .then(() => { if (session === cardSession) { cardMounted = true; controls(); } }).catch(() => {
+        if (session !== cardSession) return;
         $("card-status").textContent = "Secure card fields could not load. Reload this page to retry.";
         $("card-form").hidden = true;
       });
@@ -590,7 +658,9 @@ async function restoreCard(result, method = activeMethod.includes("card") ? acti
   savedCardAuthenticationUrl = method === "saved-card" ? result.order.payerActionUrl : undefined;
   // A confirmed unapproved order can be retried with the SAME create key. A
   // previous capture attempt always keeps the checkout locked for recovery.
-  const retryable = ["CREATED", "PAYER_ACTION_REQUIRED"].includes(result.order.status) && !result.traces?.capture?.attempted;
+  const captureAttempted = cardCaptureAttempted || result.traces?.capture?.attempted;
+  const retryable = (["CREATED", "PAYER_ACTION_REQUIRED"].includes(result.order.status) ||
+    (method === "card" && result.order.status === "APPROVED")) && !captureAttempted;
   unresolved = Boolean(savedCardAuthenticationUrl) || !retryable;
   status(approvedCardOrderId ? "Card payment approved. Click Complete approved card payment to capture this order." : savedCardAuthenticationUrl ? "Complete card authentication before capturing this payment." :
     retryable ? "Card payment is not approved. Review the card details and retry the same checkout." : "Card payment is not confirmed. Check its status before another purchase.");
@@ -601,17 +671,24 @@ $("card-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   if (flow === "new" && selectedMethod !== "card") return;
   if (busy || paid || unresolved || submittingPayment || cardSubmitting || !cardMounted) return;
-  cardStage = "validation";
+  const session = cardSession;
+  const fields = cardFields;
+  if (!session) return;
+  cardStage = session.stage = "validation";
   cardCancelled = false;
   busy = submittingPayment = cardSubmitting = true;
   controls();
   try {
-    const state = await cardFields.getState();
+    const state = await fields.getState();
+    if (session !== cardSession || session.interrupted) return;
     if (!state.isFormValid) {
       status("Check the card number, expiry date, and security code.", "error");
       return;
     }
     activeMethod = "card";
+    cardInterrupted = false;
+    cardCaptureAttempted = false;
+    if (approvedCardOrderId) sessionStorage.removeItem(storageKey("card"));
     saveCardChoice = flow === "new" && $("save-card").checked;
     approvedOrderId = approvedCardOrderId = cardOrderId = lastOrderId = undefined;
     sessionStorage.removeItem(storageKey("component"));
@@ -621,16 +698,21 @@ $("card-form").addEventListener("submit", async (event) => {
     status("Submitting the card payment to PayPal Sandbox…");
     // Hosted card details go directly to PayPal through the SDK. The Worker
     // receives only checkout metadata, consent, and the idempotency request ID.
-    cardStage = "submit";
-    await cardFields.submit();
+    cardStage = session.stage = "submit";
+    const result = await fields.submit();
+    const ignored = session !== cardSession || session.interrupted;
+    log("CardFields.submit 3DS result", { source: "frontend", orderID: session.orderID, ignored, ...frontendCardResult(result) });
+    if (ignored) return;
     if (!paid && !unresolved && cardOrderId) {
       unresolved = true;
       status("Card payment is awaiting confirmation. Check payment status before retrying.");
     }
-  } catch (error) { if (!paid) cardError(error, "submit-rejected"); }
+  } catch (error) { if (!paid) cardError(error, "submit-rejected", session); }
   finally {
-    busy = submittingPayment = cardSubmitting = false;
-    controls();
+    if (session === cardSession) {
+      busy = submittingPayment = cardSubmitting = false;
+      controls();
+    }
   }
 });
 
@@ -643,6 +725,7 @@ $("resume-card").addEventListener("click", async () => {
 async function payWithSavedCard() {
   busy = submittingPayment = true;
   activeMethod = "saved-card";
+  cardCaptureAttempted = false;
   cardOrderId = lastOrderId = approvedCardOrderId = savedCardAuthenticationUrl = undefined;
   for (const kind of ["card", "component", "direct"]) sessionStorage.removeItem(storageKey(kind));
   resetApiTraces();
@@ -712,6 +795,7 @@ $("place-order")?.addEventListener("click", async () => {
     if (!unresolved) $("checkout-controls").hidden = true;
   } finally {
     submittingPayment = false;
+    controls();
   }
 });
 
