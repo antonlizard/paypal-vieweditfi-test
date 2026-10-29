@@ -59,6 +59,7 @@ function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, has
             throw new Error("3DS iframe closed with private SDK details");
           }
           if (options.cardConfirmWait) await options.cardConfirmWait;
+          if (options.cardNoApproval) return;
           await configuration.onApprove({ orderID, ...(options.cardApproval || {}) });
           if (options.duplicateCardApproval) await configuration.onApprove({ orderID });
         },
@@ -735,6 +736,97 @@ test("an approved uncaptured card restored after reload can be abandoned for Pay
   assert.equal(page.element("checkout-controls").inert, false);
   await page.callbacks.createOrder();
   assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+  assert.equal(page.storage.has("editfi:new:card"), false);
+});
+
+test("a restored voided order enables save consent and starts a fresh card order", async () => {
+  const oldKey = crypto.randomUUID();
+  const page = browser("new", (path) => {
+    if (path.startsWith("/api/operations/")) return { flow: "card", savePaymentMethod: true, order: { id: "VOIDED00001" } };
+    if (path === "/api/orders/VOIDED00001") return { order: { id: "VOIDED00001", status: "VOIDED" } };
+  }, savedBuyer, true, { storage: [["editfi:new:card", oldKey]] });
+  await page.ready();
+  await page.openCard();
+  assert.equal(page.element("save-card").disabled, false);
+  assert.equal(page.element("card-submit").disabled, false);
+  assert.match(page.element("status").textContent, /VOIDED/);
+  page.element("save-card").checked = false;
+  await page.submitCard();
+  const input = page.requests.find((request) => request.path === "/api/orders").body;
+  assert.notEqual(input.requestId, oldKey);
+  assert.equal(input.savePaymentMethod, false);
+  assert.match(page.element("status").textContent, /Card payment completed/);
+});
+
+for (const outcome of ["declined-capture", "INSTRUMENT_DECLINED", "TRANSACTION_REFUSED"]) {
+  test(`${outcome} releases card checkout and permits a fresh consent choice`, async () => {
+    const oldKey = crypto.randomUUID();
+    const order = outcome === "declined-capture" ? { id: "FAILED00001", status: "COMPLETED", purchase_units: [{
+      payments: { captures: [{ id: "DECLINED0001", status: "DECLINED" }] },
+    }] } : { id: "FAILED00001", status: "APPROVED", cardAuthenticated: true };
+    const traces = { capture: { attempted: true, request: captureTrace.request, response: {
+      status: outcome === "declined-capture" ? 201 : 422,
+      body: outcome === "declined-capture" ? order : { name: "UNPROCESSABLE_ENTITY", details: [{ issue: outcome }] },
+    } } };
+    const page = browser("new", (path) => {
+      if (path.startsWith("/api/operations/")) return { flow: "card", savePaymentMethod: false, order: { id: order.id }, traces };
+      if (path === `/api/orders/${order.id}`) return { order, traces };
+    }, savedBuyer, true, { storage: [["editfi:new:card", oldKey]] });
+    await page.ready();
+    await page.openCard();
+    assert.equal(page.element("save-card").disabled, false);
+    assert.equal(page.element("card-submit").disabled, false);
+    page.element("save-card").checked = true;
+    await page.submitCard();
+    const input = page.requests.find((request) => request.path === "/api/orders").body;
+    assert.notEqual(input.requestId, oldKey);
+    assert.equal(input.savePaymentMethod, true);
+  });
+}
+
+test("a resolved SDK submit without approval checks the order and leaves uncaptured checkout editable", async () => {
+  const page = browser("new", (path) => {
+    if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" } };
+  }, savedBuyer, true, { cardNoApproval: true });
+  await page.ready();
+  await page.openCard();
+  await page.submitCard();
+  assert.equal(page.requests.some((request) => request.path === `/api/orders/${complete.id}`), true);
+  assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+  assert.equal(page.element("save-card").disabled, false);
+  assert.equal(page.element("card-submit").disabled, false);
+});
+
+test("an already-captured API issue cannot be treated as a declined payment", async () => {
+  const page = browser("new", (path) => {
+    if (path.startsWith("/api/operations/")) return { flow: "card", savePaymentMethod: false, order: { id: complete.id } };
+    if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "APPROVED" }, traces: {
+      capture: { ...captureTrace, response: { status: 422, body: { details: [{ issue: "ORDER_ALREADY_CAPTURED" }] } } },
+    } };
+  }, savedBuyer, true, { storage: [["editfi:new:card", crypto.randomUUID()]] });
+  await page.ready();
+  await page.openCard();
+  assert.equal(page.element("save-card").disabled, false);
+  assert.equal(page.element("card-submit").disabled, true);
+  await page.submitCard();
+  assert.equal(page.requests.some((request) => request.path === "/api/orders"), false);
+});
+
+test("a confirmed decline during capture enables a fresh card submission without a reload", async () => {
+  const page = browser("new", (path) => {
+    if (path.endsWith("/capture")) return Response.json({ error: "PAYPAL_API_ERROR", message: "Card declined", details: {
+      traces: {
+        get: { request: { method: "GET", url: "/v2/checkout/orders/ORDER00001", headers: {}, authentication: { method: "Bearer" } },
+          response: { status: 200, body: { id: complete.id, status: "APPROVED" } } },
+        capture: { ...captureTrace, response: { status: 422, body: { details: [{ issue: "INSTRUMENT_DECLINED" }] } } },
+      },
+    } }, { status: 502 });
+  });
+  await page.ready();
+  await page.openCard();
+  await page.submitCard();
+  assert.equal(page.element("save-card").disabled, false);
+  assert.equal(page.element("card-submit").disabled, false);
   assert.equal(page.storage.has("editfi:new:card"), false);
 });
 

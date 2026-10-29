@@ -7,6 +7,7 @@ let selectedMethod, renderNewPayPalButton, renderCardFields;
 let cardStage = "idle", cardCancelled = false;
 let cardSession, cardFieldElements = [], cardInterrupted = false;
 let cardCaptureAttempted = false;
+let cardNeedsNewOrder = false;
 const activity = [];
 const backendErrors = new WeakSet();
 const context = () => flow === "new" ? "new" : `returning:${buyer?.revision}`;
@@ -85,7 +86,7 @@ function controls() {
     $("authenticate-saved-card").hidden = paid || !savedCardAuthenticationUrl;
     $("authenticate-saved-card").disabled = busy || submittingPayment;
   }
-  for (const id of ["save-paypal", "save-card"]) if ($(id)) $(id).disabled = locked;
+  for (const id of ["save-paypal", "save-card"]) if ($(id)) $(id).disabled = processing || paid;
   $("check-status").hidden = paid || (!unresolved && !cardInterrupted);
   $("success-actions").hidden = !paid;
   if (paid) {
@@ -166,6 +167,7 @@ function showPaymentDetails(order) {
 async function finish(result) {
   const order = result.order;
   if (!order?.id) throw new Error("The server did not return an order ID.");
+  if (activeMethod.includes("card") && failedCardPayment(order, result.traces)) return restoreCard(result);
   lastOrderId = order.id;
   showPaymentDetails(order);
   log("Orders v2 response", order);
@@ -185,6 +187,16 @@ async function finish(result) {
 
 function hasCapture(order) {
   return order.purchase_units?.some((unit) => unit.payments?.captures?.length);
+}
+
+function failedCardPayment(order, traces) {
+  const captures = [order, traces?.capture?.response?.body].flatMap((value) =>
+    (value?.purchase_units || []).flatMap((unit) => unit.payments?.captures || []));
+  if (captures.some((capture) => ["COMPLETED", "PENDING"].includes(capture.status))) return false;
+  if (order.status === "VOIDED" || (captures.length > 0 && captures.every((capture) => ["DECLINED", "FAILED"].includes(capture.status)))) return true;
+  const response = traces?.capture?.response;
+  return ["CREATED", "APPROVED", "PAYER_ACTION_REQUIRED"].includes(order.status) && [400, 422].includes(response?.status) &&
+    Array.isArray(response.body?.details) && response.body.details.some((detail) => ["INSTRUMENT_DECLINED", "TRANSACTION_REFUSED"].includes(detail.issue));
 }
 
 function awaitPlacement(order) {
@@ -559,7 +571,14 @@ function cardError(error, callback = "sdk-onError", session = cardSession) {
   }
   log("CardFields error 3DS result", { source: "frontend", callback, orderID: session?.orderID, ignored, ...cardSdkDiagnostic(error) });
   if (ignored || cardCancelled) return;
-  const captureUncertain = session.stage === "capture" && safe.code !== "CARD_AUTHENTICATION_REQUIRED";
+  const verifiedOrder = safe.details?.traces?.get?.response?.body;
+  const declined = backendErrors.has(safe) && verifiedOrder && failedCardPayment(verifiedOrder, safe.details.traces);
+  const captureUncertain = session.stage === "capture" && safe.code !== "CARD_AUTHENTICATION_REQUIRED" && !declined;
+  if (declined) {
+    cardNeedsNewOrder = true;
+    cardCaptureAttempted = false;
+    sessionStorage.removeItem(storageKey("card"));
+  }
   if (captureUncertain && safe.code === "CARD_SDK_ERROR") safe.message = "The capture result is uncertain. Check payment status before submitting another payment. You can still edit or switch methods.";
   showError(safe);
   resetInterruptedCard(session, captureUncertain);
@@ -608,7 +627,8 @@ function initializeCardFields(paypal) {
       },
       onError: (error) => cardError(error, "sdk-onError", session),
       onCancel: () => onCardCancel(session),
-      style: { input: { "font-family": "Arial, sans-serif", "font-size": "15px", color: "#152544", padding: "12px" }, ".invalid": { color: "#a64237" } },
+      style: { input: { "font-family": "Arial, sans-serif", "font-size": "16px", "line-height": "24px",
+        color: "#152544", padding: "6px 0", border: "0", "border-radius": "0" }, ".invalid": { color: "#a64237" } },
     });
     if (!cardFields.isEligible()) throw new Error("This Sandbox REST app is not eligible for Card Fields.");
     log("CardFields v5 3DS callback availability", { onApprove: true, onError: true, onCancel: true,
@@ -641,7 +661,8 @@ function initializeCardFields(paypal) {
 async function restoreCard(result, method = activeMethod.includes("card") ? activeMethod : "card") {
   activeMethod = method;
   cardOrderId = lastOrderId = result.order.id;
-  if (result.order.completed || hasCapture(result.order)) return finish(result);
+  const failed = failedCardPayment(result.order, result.traces);
+  if (result.order.completed || (hasCapture(result.order) && !failed)) return finish(result);
   busy = false;
   showPaymentDetails(result.order);
   const authentication = result.order.payment_source?.card?.authentication_result;
@@ -659,11 +680,20 @@ async function restoreCard(result, method = activeMethod.includes("card") ? acti
   // A confirmed unapproved order can be retried with the SAME create key. A
   // previous capture attempt always keeps the checkout locked for recovery.
   const captureAttempted = cardCaptureAttempted || result.traces?.capture?.attempted;
-  const retryable = (["CREATED", "PAYER_ACTION_REQUIRED"].includes(result.order.status) ||
-    (method === "card" && result.order.status === "APPROVED")) && !captureAttempted;
-  unresolved = Boolean(savedCardAuthenticationUrl) || !retryable;
+  const retryable = failed || (!captureAttempted && (method === "card" ? ["CREATED", "SAVED", "APPROVED", "PAYER_ACTION_REQUIRED"].includes(result.order.status) :
+    ["CREATED", "PAYER_ACTION_REQUIRED"].includes(result.order.status)));
+  cardNeedsNewOrder = retryable && !["CREATED", "PAYER_ACTION_REQUIRED"].includes(result.order.status);
+  if (failed) {
+    cardCaptureAttempted = false;
+    approvedCardOrderId = savedCardAuthenticationUrl = undefined;
+    sessionStorage.removeItem(storageKey(method === "saved-card" ? "saved-card" : "card"));
+  }
+  unresolved = !failed && (Boolean(savedCardAuthenticationUrl) || !retryable);
+  cardInterrupted = !paid;
   status(approvedCardOrderId ? "Card payment approved. Click Complete approved card payment to capture this order." : savedCardAuthenticationUrl ? "Complete card authentication before capturing this payment." :
-    retryable ? "Card payment is not approved. Review the card details and retry the same checkout." : "Card payment is not confirmed. Check its status before another purchase.");
+    failed ? `Order ${result.order.id} (${result.order.status}) did not complete payment. You can pay again or choose another method.` :
+    retryable ? "Card payment is not approved. Review the card details and retry checkout." :
+      `Order ${result.order.id} (${result.order.status}): the capture result is not confirmed. Check payment status to resolve this attempt.`);
   controls();
 }
 
@@ -688,8 +718,10 @@ $("card-form").addEventListener("submit", async (event) => {
     activeMethod = "card";
     cardInterrupted = false;
     cardCaptureAttempted = false;
-    if (approvedCardOrderId) sessionStorage.removeItem(storageKey("card"));
-    saveCardChoice = flow === "new" && $("save-card").checked;
+    const saving = flow === "new" && $("save-card").checked;
+    if (approvedCardOrderId || cardNeedsNewOrder || saving !== saveCardChoice) sessionStorage.removeItem(storageKey("card"));
+    cardNeedsNewOrder = false;
+    saveCardChoice = saving;
     approvedOrderId = approvedCardOrderId = cardOrderId = lastOrderId = undefined;
     sessionStorage.removeItem(storageKey("component"));
     sessionStorage.removeItem(storageKey("direct"));
@@ -704,8 +736,9 @@ $("card-form").addEventListener("submit", async (event) => {
     log("CardFields.submit 3DS result", { source: "frontend", orderID: session.orderID, ignored, ...frontendCardResult(result) });
     if (ignored) return;
     if (!paid && !unresolved && cardOrderId) {
-      unresolved = true;
-      status("Card payment is awaiting confirmation. Check payment status before retrying.");
+      // A resolved submit without onApprove is not proof of capture. Read the
+      // order rather than freezing checkout on an assumed unknown payment.
+      await restoreCard(await api(`/api/orders/${encodeURIComponent(cardOrderId)}`), "card");
     }
   } catch (error) { if (!paid) cardError(error, "submit-rejected", session); }
   finally {
