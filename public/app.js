@@ -450,7 +450,7 @@ function cardError(error) {
   // SDK error objects can contain field-level data. Never log or persist them.
   const safe = error?.code && error.details?.traces ? error : new Error(
     cardOrderId ? "Card submission was interrupted. Check payment status before trying again." :
-      "Card payment could not be submitted. Review the card and billing fields, then retry.",
+      "Card payment could not be submitted. Review the card fields, then retry.",
   );
   showError(safe);
 }
@@ -543,13 +543,9 @@ $("card-form").addEventListener("submit", async (event) => {
     showPaymentDetails(null);
     resetApiTraces();
     status("Submitting the card payment to PayPal Sandbox…");
-    // Billing details and hosted card fields go directly to PayPal through the
-    // SDK. Our Worker receives only flow/page and the idempotency request ID.
-    await cardFields.submit({ billingAddress: {
-      addressLine1: $("billing-line1").value.trim(), addressLine2: $("billing-line2").value.trim(),
-      adminArea1: $("billing-region").value.trim(), adminArea2: $("billing-city").value.trim(),
-      postalCode: $("billing-postal").value.trim(), countryCode: $("billing-country").value.trim().toUpperCase(),
-    } });
+    // Hosted card details go directly to PayPal through the SDK. The Worker
+    // receives only checkout metadata, consent, and the idempotency request ID.
+    await cardFields.submit();
     if (!paid && !unresolved && cardOrderId) {
       unresolved = true;
       status("Card payment is awaiting confirmation. Check payment status before retrying.");

@@ -32,12 +32,6 @@
                 <p class="field-label">Cardholder name</p><div id="card-name-field" class="card-field"></div>
                 <p class="field-label">Card number</p><div id="card-number-field" class="card-field"></div>
                 <div class="card-field-row"><div><p class="field-label">Expiry date</p><div id="card-expiry-field" class="card-field"></div></div><div><p class="field-label">Security code</p><div id="card-cvv-field" class="card-field"></div></div></div>
-                <fieldset class="billing-fields"><legend>Billing address</legend>
-                  <label>Address line 1<input id="billing-line1" autocomplete="billing address-line1" required maxlength="300"></label>
-                  <label>Address line 2 (optional)<input id="billing-line2" autocomplete="billing address-line2" maxlength="300"></label>
-                  <div class="card-field-row"><label>City<input id="billing-city" autocomplete="billing address-level2" required maxlength="120"></label><label>Postal code<input id="billing-postal" autocomplete="billing postal-code" required maxlength="60"></label></div>
-                  <div class="card-field-row"><label>State / region (optional)<input id="billing-region" autocomplete="billing address-level1" maxlength="120"></label><label>Country code<input id="billing-country" autocomplete="billing country" value="DE" required pattern="[A-Za-z]{2}" maxlength="2" title="Two-letter country code, for example DE or US"></label></div>
-                </fieldset>
                 <button id="card-submit" class="button primary" type="submit" disabled>Pay by card <span data-amount>—</span></button>
                 <p class="component-note">PayPal securely collects your card details. Using a different card here preserves your saved payment method.</p>
               </form>

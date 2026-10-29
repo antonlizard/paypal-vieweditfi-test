@@ -104,10 +104,6 @@ function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, has
       element("card-option").open = true;
       await element("card-option").events.toggle?.();
     }
-    element("billing-line1").value = "Test street 1";
-    element("billing-city").value = "Berlin";
-    element("billing-postal").value = "10115";
-    element("billing-country").value = "DE";
   }
   const submitCard = () => element("card-form").events.submit({ preventDefault() {} });
   return { ready, selectMethod, openCard, submitCard, element, scripts, renders, cardRenders, cardSubmissions, requests, navigations, storage, get callbacks() { return callbacks; }, get cardCallbacks() { return cardCallbacks; } };
@@ -444,13 +440,7 @@ for (const flow of ["new", "returning"]) {
     assert.match(page.element("status").textContent, /Card payment completed/);
     assert.equal(page.element("status").textContent.includes("Vaulting is pending"), false);
     assert.equal(page.element("alternative-controls").hidden, true);
-    assert.equal(page.cardSubmissions[0].billingAddress.countryCode, "DE");
-    assert.equal(page.cardSubmissions[0].billingAddress.adminArea2, "Berlin");
-    for (const privateValue of ["Test street 1", "10115", "Berlin"]) {
-      assert.equal(JSON.stringify(page.requests).includes(privateValue), false);
-      assert.equal(JSON.stringify([...page.storage]).includes(privateValue), false);
-      assert.equal(page.element("activity").textContent.includes(privateValue), false);
-    }
+    assert.deepEqual(page.cardSubmissions, [undefined]);
   });
 }
 
