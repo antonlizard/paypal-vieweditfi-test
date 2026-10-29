@@ -443,10 +443,7 @@ if (flow === "new") {
 function configureWalletPlaceholder() {
   const agent = navigator.userAgent || "";
   const appleDevice = /Mac|iPhone|iPad|iPod/i.test(`${navigator.platform || ""} ${agent}`);
-  const iosDevice = /iPhone|iPad|iPod/i.test(`${navigator.platform || ""} ${agent}`) ||
-    (/Mac/i.test(navigator.platform || "") && navigator.maxTouchPoints > 1);
-  const safari = /Safari/i.test(agent) && !/Chrome|Chromium|CriOS|Edg|OPR|FxiOS|Android/i.test(agent);
-  const wallet = typeof window.ApplePaySession !== "undefined" || iosDevice || (appleDevice && safari) ? "Apple Pay" : "Google Pay";
+  const wallet = typeof window.ApplePaySession !== "undefined" || appleDevice ? "Apple Pay" : "Google Pay";
   $("wallet-label").textContent = wallet;
   if (flow === "new") $("wallet-choice-label").textContent = wallet;
   $("wallet-option").disabled = true;

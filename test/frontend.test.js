@@ -689,7 +689,7 @@ for (const scenario of [
   { name: "Chrome on iPhone", userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 CriOS/130.0 Mobile/15E148 Safari/604.1", platform: "iPhone", wallet: "Apple Pay" },
   { name: "Chrome on iPad", userAgent: "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 CriOS/130.0 Mobile/15E148 Safari/604.1", platform: "iPad", wallet: "Apple Pay" },
   { name: "desktop-mode iPad Chrome", userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) AppleWebKit/605.1.15 CriOS/130.0 Safari/605.1.15", platform: "MacIntel", maxTouchPoints: 5, wallet: "Apple Pay" },
-  { name: "Chrome on macOS", userAgent: "Mozilla/5.0 Macintosh Chrome/130.0 Safari/537.36", platform: "MacIntel", wallet: "Google Pay" },
+  { name: "Chrome on macOS", userAgent: "Mozilla/5.0 Macintosh Chrome/130.0 Safari/537.36", platform: "MacIntel", wallet: "Apple Pay" },
   { name: "Chrome on Android", userAgent: "Mozilla/5.0 Android Chrome/130.0 Mobile Safari/537.36", platform: "Linux armv8", wallet: "Google Pay" },
   { name: "a browser exposing ApplePaySession", applePay: true, wallet: "Apple Pay" },
 ]) {
