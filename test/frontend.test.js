@@ -47,6 +47,15 @@ function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, has
           cardSubmissions.push(values);
           const orderID = await configuration.createOrder();
           if (options.cardFailure) throw new Error("Card validation failed with private SDK details");
+          if (options.cardSDKError) {
+            configuration.onError(options.cardSDKError);
+            throw options.cardSDKError;
+          }
+          if (options.cardCancel) {
+            configuration.onCancel();
+            if (options.lateCardApproval) await configuration.onApprove({ orderID });
+            throw new Error("3DS iframe closed with private SDK details");
+          }
           if (options.cardConfirmWait) await options.cardConfirmWait;
           await configuration.onApprove({ orderID });
           if (options.duplicateCardApproval) await configuration.onApprove({ orderID });
@@ -543,6 +552,62 @@ test("a failed card confirmation is recovered using the same order creation key"
   const creates = page.requests.filter((request) => request.path === "/api/orders");
   assert.equal(creates.length, 2);
   assert.equal(creates[0].body.requestId, creates[1].body.requestId);
+});
+
+const sdkFailure = {
+  name: "UNPROCESSABLE_ENTITY", code: "CARD_FIELDS_3DS_ERROR", debug_id: "0123456789abc",
+  message: "3D Secure authentication failed with private SDK details",
+  details: [{ issue: "PAYER_ACTION_REQUIRED", description: "private SDK details", value: "4111111111111111" }],
+  card: { number: "4111111111111111", cvv: "123" }, authorization: "Bearer private-sdk-token",
+};
+for (const scenario of [
+  { name: "a structured SDK failure", error: sdkFailure, category: "AUTHENTICATION_FAILED", structured: true },
+  { name: "a serialized SDK failure", error: new Error(`PayPal error: ${JSON.stringify(sdkFailure)}`), category: "AUTHENTICATION_FAILED", structured: true },
+  { name: "an iframe communication failure", error: new Error("zoid iframe failed at https://example.test/?token=private-sdk-token with private SDK details"), category: "IFRAME_COMMUNICATION" },
+]) {
+  test(`${scenario.name} preserves safe 3DS diagnostics without exposing raw SDK data`, async () => {
+    const page = browser("new", undefined, savedBuyer, true, { cardSDKError: scenario.error });
+    await page.ready();
+    await page.openCard();
+    await page.submitCard();
+    const activity = page.element("activity").textContent;
+    assert.match(activity, /CARD_SDK_ERROR/);
+    assert.match(activity, /"stage": "authentication"/);
+    assert.match(activity, /"callback": "sdk-onError"/);
+    assert.match(activity, /"callback": "submit-rejected"/);
+    assert.ok(activity.includes(scenario.category));
+    if (scenario.structured) {
+      for (const id of [sdkFailure.name, sdkFailure.code, sdkFailure.debug_id, sdkFailure.details[0].issue]) assert.ok(activity.includes(id));
+    }
+    for (const value of ["4111111111111111", "private-sdk-token", "private SDK details", "example.test"]) assert.equal(activity.includes(value), false);
+    assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+    assert.equal(page.element("check-status").hidden, false);
+  });
+}
+
+test("3DS cancellation blocks a late approval and status recovery logs PayPal's authentication result without capturing", async () => {
+  const page = browser("new", (path) => {
+    if (path === `/api/orders/${complete.id}`) return { order: {
+      id: complete.id, status: "APPROVED", cardAuthenticated: true,
+      payment_source: { card: { authentication_result: {
+        liability_shift: "POSSIBLE", three_d_secure: { authentication_status: "Y", enrollment_status: "Y" },
+      } } },
+    } };
+  }, savedBuyer, true, { cardCancel: true, lateCardApproval: true });
+  await page.ready();
+  await page.openCard();
+  await page.submitCard();
+  assert.match(page.element("status").textContent, /verification was cancelled or closed/);
+  assert.match(page.element("activity").textContent, /Card 3DS cancelled or closed/);
+  assert.equal(page.element("activity").textContent.includes("private SDK details"), false);
+  assert.equal(page.element("activity").textContent.includes("CARD_SDK_ERROR"), false);
+  assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+  await page.element("check-status").events.click();
+  assert.match(page.element("activity").textContent, /Card authentication status from PayPal/);
+  assert.match(page.element("activity").textContent, /"authenticationStatus": "Y"/);
+  assert.match(page.element("activity").textContent, /"liabilityShift": "POSSIBLE"/);
+  assert.equal(page.element("resume-card").hidden, false);
+  assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
 });
 
 test("reload and card redirects restore approved card orders without an automatic capture", async () => {

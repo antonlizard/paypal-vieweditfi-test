@@ -4,7 +4,9 @@ let settings, buyer, mounted = false, busy = false, paid = false, unresolved = f
 let cardFields, cardMounted = false, cardRendering, cardSubmitting = false, cardOrderId, approvedCardOrderId, cardCapturePromise, activeMethod = "paypal";
 let savePayPalChoice = false, saveCardChoice = false, savedCardAuthenticationUrl;
 let selectedMethod, renderNewPayPalButton, renderCardFields;
+let cardStage = "idle", cardCancelled = false;
 const activity = [];
+const backendErrors = new WeakSet();
 const context = () => flow === "new" ? "new" : `returning:${buyer?.revision}`;
 const storageKey = (kind) => `editfi:${kind === "card" ? flow : context()}:${kind}`;
 const placeOrderPrompt = 'Payment method approved. Click "Place order with saved method" to complete the purchase.';
@@ -110,6 +112,7 @@ async function api(path, body) {
   if (!response.ok) {
     const error = new Error(result.message || `Request failed (${response.status}).`);
     Object.assign(error, { code: result.error, details: result.details });
+    backendErrors.add(error);
     throw error;
   }
   return result;
@@ -443,24 +446,79 @@ function configureWalletPlaceholder() {
   $("wallet-note").textContent = `${wallet} is a display-only option. No wallet payment will be started.`;
 }
 
-function cardError(error) {
+function cardSdkDiagnostic(error) {
+  // SDK messages may contain serialized API errors, URLs, card values, or
+  // credentials. Extract identifiers only; never log the raw message/object.
+  const nodes = [];
+  const messages = [];
+  for (const candidate of [error, error?.data, error?.cause]) {
+    if (!candidate) continue;
+    if (typeof candidate === "object") nodes.push(candidate);
+    const message = typeof candidate === "string" ? candidate : candidate.message;
+    if (typeof message !== "string") continue;
+    messages.push(message.slice(0, 20000));
+    const start = message.indexOf("{"), end = message.lastIndexOf("}");
+    if (start < 0 || end < start || end - start > 20000) continue;
+    try { nodes.push(JSON.parse(message.slice(start, end + 1))); } catch {}
+  }
+  const code = (value) => typeof value === "string" && /^[A-Z][A-Z0-9_]{2,79}$/.test(value) ? value : undefined;
+  const diagnostic = {};
+  const issues = new Set();
+  for (const node of nodes) {
+    diagnostic.sdkCode ||= code(node?.code);
+    diagnostic.sdkName ||= code(node?.name);
+    const debugId = node?.debug_id || node?.debugId;
+    if (typeof debugId === "string" && /^[a-f0-9]{13,32}$/i.test(debugId)) diagnostic.debugId ||= debugId;
+    for (const detail of Array.isArray(node?.details) ? node.details.slice(0, 10) : []) {
+      const issue = code(detail?.issue);
+      if (issue) issues.add(issue);
+    }
+  }
+  if (issues.size) diagnostic.issues = [...issues];
+  const text = messages.join(" ");
+  diagnostic.category = /cancel|closed|dismiss/i.test(text) ? "CHALLENGE_CLOSED" :
+    /iframe|frame|post.?robot|zoid|window|origin/i.test(text) ? "IFRAME_COMMUNICATION" :
+    /network|fetch|timeout|timed.out|connection/i.test(text) ? "NETWORK_OR_TIMEOUT" :
+    /authentica|3.?d.?secure|3ds|contingen/i.test(text) ? "AUTHENTICATION_FAILED" :
+    /instrument|declin/i.test(text) ? "INSTRUMENT_DECLINED" :
+    /invalid|validation|field/i.test(text) ? "VALIDATION_FAILED" : "SDK_ERROR";
+  return diagnostic;
+}
+
+function cardError(error, callback = "sdk-onError") {
   if (paid) return;
+  if (cardCancelled) return; // A later rejection must not hide cancellation.
   busy = false;
   unresolved = Boolean(cardOrderId) && !paid;
-  // SDK error objects can contain field-level data. Never log or persist them.
-  const safe = error?.code && error.details?.traces ? error : new Error(
+  const safe = error && typeof error === "object" && backendErrors.has(error) ? error : new Error(
     cardOrderId ? "Card submission was interrupted. Check payment status before trying again." :
       "Card payment could not be submitted. Review the card fields, then retry.",
   );
+  if (safe !== error) {
+    safe.code = "CARD_SDK_ERROR";
+    safe.details = { orderID: cardOrderId, stage: cardStage, callback, ...cardSdkDiagnostic(error) };
+  }
   showError(safe);
+}
+
+function onCardCancel() {
+  if (paid || cardStage === "capture") return;
+  cardCancelled = true;
+  busy = false;
+  unresolved = Boolean(cardOrderId);
+  status("3D Secure verification was cancelled or closed. Check payment status before trying again.", "error");
+  log("Card 3DS cancelled or closed", { orderID: cardOrderId, stage: cardStage });
+  controls();
 }
 
 async function createCardOrder() {
   if (!cardSubmitting || paid || unresolved) throw new Error("Submit the card form to start this payment.");
+  cardStage = "create-order";
   const result = await api("/api/orders", { flow: "card", page: flow, requestId: requestId("card"), ...(flow === "new" ? { savePaymentMethod: saveCardChoice } : {}) });
   cardOrderId = lastOrderId = result.order.id;
   showPaymentDetails(result.order);
   log("Card order created", { orderID: cardOrderId });
+  cardStage = "authentication";
   return cardOrderId;
 }
 
@@ -470,15 +528,21 @@ function initializeCardFields(paypal) {
     cardFields = paypal.CardFields({
       createOrder: createCardOrder,
       onApprove(data) {
-        if (paid || unresolved) return;
+        if (paid || unresolved || cardCancelled) return;
         if (!cardSubmitting || data.orderID !== cardOrderId) throw new Error("Unexpected card order approval.");
         if (!cardCapturePromise) {
+          cardStage = "capture";
+          log("Card SDK approved; requesting backend verification and capture", {
+            orderID: data.orderID,
+            ...(["POSSIBLE", "NO", "UNKNOWN"].includes(data.liabilityShift) ? { liabilityShift: data.liabilityShift } : {}),
+          });
           approvedCardOrderId = data.orderID;
           cardCapturePromise = captureOrder(data.orderID).finally(() => { cardCapturePromise = undefined; });
         }
         return cardCapturePromise;
       },
-      onError: cardError,
+      onError: (error) => cardError(error, "sdk-onError"),
+      onCancel: onCardCancel,
       style: { input: { "font-family": "Arial, sans-serif", "font-size": "15px", color: "#152544", padding: "12px" }, ".invalid": { color: "#a64237" } },
     });
     if (!cardFields.isEligible()) throw new Error("This Sandbox REST app is not eligible for Card Fields.");
@@ -512,6 +576,16 @@ async function restoreCard(result, method = activeMethod.includes("card") ? acti
   if (result.order.completed || hasCapture(result.order)) return finish(result);
   busy = false;
   showPaymentDetails(result.order);
+  const authentication = result.order.payment_source?.card?.authentication_result;
+  const threeDS = authentication?.three_d_secure;
+  log("Card authentication status from PayPal", {
+    orderID: result.order.id,
+    status: result.order.status,
+    authenticated: result.order.cardAuthenticated === true,
+    ...(["POSSIBLE", "NO", "UNKNOWN"].includes(authentication?.liability_shift) ? { liabilityShift: authentication.liability_shift } : {}),
+    ...(/^[YNURABCID]$/.test(threeDS?.authentication_status || "") ? { authenticationStatus: threeDS.authentication_status } : {}),
+    ...(/^[YNU]$/.test(threeDS?.enrollment_status || "") ? { enrollmentStatus: threeDS.enrollment_status } : {}),
+  });
   approvedCardOrderId = result.order.status === "APPROVED" && result.order.cardAuthenticated === true ? result.order.id : undefined;
   savedCardAuthenticationUrl = method === "saved-card" ? result.order.payerActionUrl : undefined;
   // A confirmed unapproved order can be retried with the SAME create key. A
@@ -527,6 +601,8 @@ $("card-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   if (flow === "new" && selectedMethod !== "card") return;
   if (busy || paid || unresolved || submittingPayment || cardSubmitting || !cardMounted) return;
+  cardStage = "validation";
+  cardCancelled = false;
   busy = submittingPayment = cardSubmitting = true;
   controls();
   try {
@@ -545,12 +621,13 @@ $("card-form").addEventListener("submit", async (event) => {
     status("Submitting the card payment to PayPal Sandbox…");
     // Hosted card details go directly to PayPal through the SDK. The Worker
     // receives only checkout metadata, consent, and the idempotency request ID.
+    cardStage = "submit";
     await cardFields.submit();
     if (!paid && !unresolved && cardOrderId) {
       unresolved = true;
       status("Card payment is awaiting confirmation. Check payment status before retrying.");
     }
-  } catch (error) { if (!paid) cardError(error); }
+  } catch (error) { if (!paid) cardError(error, "submit-rejected"); }
   finally {
     busy = submittingPayment = cardSubmitting = false;
     controls();

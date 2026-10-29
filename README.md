@@ -27,6 +27,8 @@ The returning page displays the Order ID as soon as ViewEditFI creates the order
 
 Order and Transaction IDs also appear for card payments on both pages. Duplicate submissions reuse the same payment operation. Interrupted captures require a status check; an approved card order can be captured using **Complete approved card payment**. Reloads and card return redirects restore that browser's existing card attempt without automatically capturing. An unapproved card order confirmed by a status check can be retried with its original create key when no capture was attempted.
 
+For card/3DS troubleshooting, **Integration activity** records the checkout stage, callback, order ID, and any structured SDK error name/code, PayPal debug ID, or API issue code. Serialized SDK error messages are parsed for these identifiers; raw messages, URLs, stacks, card fields, and credentials are not logged. The error category is a best-effort classification, not a confirmed root cause. A separate cancellation handler records a closed/cancelled challenge and prevents a late approval callback from capturing it. After an interruption, select **Check payment status** to log PayPal's order status, authentication result, and liability shift when available. Status checks never capture. A generic interruption message alone cannot establish why an issuer challenge closed.
+
 Both pages include expandable **Create order**, **Confirm saved card / 3DS**, and **Capture** panels showing the backend's PayPal REST method, URL, safe headers, JSON request body, response HTTP status, and full response body. Errors are shown too. Confirm details apply to saved-card purchases. Capture details appear only after a capture is requested; direct saved-PayPal payments identify that no separate capture call was sent and show the payment result in Create order.
 
 Traces are retained with the checkout for retries and reloads. Create, confirm, and capture calls display the Bearer authorization method, but replace the token value and `Authorization` header with `[REDACTED]`. This applies to immediate success/error responses as well as saved history. The browser also masks legacy token values and does not retain them for later display. Actual PayPal requests still use the server's cached access token.
@@ -211,6 +213,7 @@ The first two commands need only Node's built-ins. The build command requires in
 - [PayPal JS SDK v5: save with a purchase](https://developer.paypal.com/sdk/js/v5/save-with-purchase/paypal)
 - [PayPal JS SDK configuration](https://developer.paypal.com/sdk/js/configuration/)
 - [Orders v2 REST API](https://developer.paypal.com/api/orders/v2)
+- [PayPal Card Fields: vaulting, 3DS, and cancellation callbacks](https://developer.paypal.com/platforms/checkout/save-payment-methods/during-purchase/js-sdk/cards/)
 - [PayPal webhook signature verification](https://developer.paypal.com/api/webhooks/v1)
 - [Cloudflare Workers GitHub integration](https://developers.cloudflare.com/workers/ci-cd/builds/git-integration/github-integration/)
 - [Cloudflare runtime secrets](https://developers.cloudflare.com/workers/configuration/secrets/)
