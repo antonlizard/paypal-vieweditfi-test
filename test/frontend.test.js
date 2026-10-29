@@ -7,6 +7,7 @@ const source = await readFile(new URL("../public/app.js", import.meta.url), "utf
 const savedBuyer = { revision: "revision-1", vaultId: "server-vault-1", state: "VAULTED", savedAt: new Date().toISOString() };
 const savedCardBuyer = { ...savedBuyer, methodType: "card", card: { brand: "VISA", lastDigits: "1111", expiry: "2030-12" } };
 const complete = { id: "ORDER00001", status: "COMPLETED", completed: true, purchase_units: [{ payments: { captures: [{ id: "CAPTURE00001", status: "COMPLETED" }] } }] };
+// Legacy responses deliberately include dummy tokens to verify UI redaction.
 const createTrace = {
   request: { method: "POST", url: "https://api-m.sandbox.paypal.com/v2/checkout/orders", headers: { "PayPal-Request-Id": "create-test", Authorization: "Bearer create-access-token" }, authentication: { method: "Bearer", token: "create-access-token" }, body: { intent: "CAPTURE", purchase_units: [{ amount: { currency_code: "EUR", value: "10.00" } }] } },
   response: { status: 201, headers: {}, body: { id: complete.id, status: "PAYER_ACTION_REQUIRED" } }, attempted: true,
@@ -210,9 +211,9 @@ test("returning approval waits for Place order, which captures the approved orde
   assert.equal(page.element("place-order").disabled, true);
   assert.equal(page.element("create-trace").open, true);
   assert.equal(page.element("create-trace-status").textContent, "HTTP 201");
-  assert.deepEqual(JSON.parse(page.element("create-request").textContent), createTrace.request);
+  assert.deepEqual(JSON.parse(page.element("create-request").textContent), savedCreateTrace.request);
   assert.equal(JSON.parse(page.element("create-request").textContent).authentication.method, "Bearer");
-  assert.equal(JSON.parse(page.element("create-request").textContent).authentication.token, "create-access-token");
+  assert.equal(JSON.parse(page.element("create-request").textContent).authentication.token, "[REDACTED]");
   assert.deepEqual(JSON.parse(page.element("create-response").textContent).body, createTrace.response.body);
   assert.equal(page.element("capture-trace-status").textContent, "Not requested");
   await page.callbacks.onApprove({ orderID: complete.id });
@@ -230,8 +231,12 @@ test("returning approval waits for Place order, which captures the approved orde
   assert.equal(page.element("capture-trace").open, true);
   assert.deepEqual(JSON.parse(page.element("capture-request").textContent).body, {});
   assert.equal(JSON.parse(page.element("capture-response").textContent).body.purchase_units[0].payments.captures[0].id, "CAPTURE00001");
-  assert.equal(JSON.parse(page.element("create-request").textContent).authentication.token, "create-access-token");
-  assert.equal(JSON.parse(page.element("capture-request").textContent).authentication.token, "capture-access-token");
+  assert.equal(JSON.parse(page.element("create-request").textContent).authentication.token, "[REDACTED]");
+  assert.equal(JSON.parse(page.element("capture-request").textContent).authentication.token, "[REDACTED]");
+  for (const kind of ["create", "capture"]) {
+    assert.equal(JSON.parse(page.element(`${kind}-request`).textContent).headers.Authorization, "[REDACTED]");
+    assert.equal(page.element(`${kind}-request`).textContent.includes("access-token"), false);
+  }
   assert.equal(page.element("activity").textContent.includes("capture-access-token"), false);
   assert.equal(JSON.stringify([...page.storage]).includes("access-token"), false);
   assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
@@ -304,7 +309,8 @@ test("a failed create displays the REST request and error response without attem
   assert.equal(JSON.parse(page.element("create-request").textContent).body.intent, "CAPTURE");
   assert.equal(JSON.parse(page.element("create-response").textContent).body.name, "UNPROCESSABLE_ENTITY");
   assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
-  assert.equal(JSON.parse(page.element("create-request").textContent).authentication.token, "create-access-token");
+  assert.equal(JSON.parse(page.element("create-request").textContent).authentication.token, "[REDACTED]");
+  assert.equal(page.element("create-request").textContent.includes("create-access-token"), false);
   assert.equal(page.element("activity").textContent.includes("create-access-token"), false);
 });
 
@@ -352,7 +358,7 @@ test("reload restores an approved order without charging until Place order", asy
   }, savedBuyer, true, { storage: first.storage });
   await restored.ready();
   assert.equal(restored.element("payment-order-id").textContent, complete.id);
-  assert.match(JSON.parse(restored.element("create-request").textContent).authentication.token, /Not retained/);
+  assert.equal(JSON.parse(restored.element("create-request").textContent).authentication.token, "[REDACTED]");
   assert.equal(restored.element("create-request").textContent.includes("create-access-token"), false);
   assert.equal(restored.element("place-order").disabled, false);
   assert.equal(restored.requests.some((request) => request.path.endsWith("/capture") || request.path === "/api/direct-charge"), false);

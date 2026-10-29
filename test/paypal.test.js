@@ -175,7 +175,7 @@ for (const scenario of [
   });
 }
 
-test("live request traces show the used Bearer token while stored traces redact credentials", async () => {
+test("immediate and stored request traces redact credentials while PayPal requests authenticate", async () => {
   const trace = {};
   const settings = { ...env, BASIC_AUTH_PASSWORD: "private-site-password" };
   const raw = {
@@ -184,9 +184,11 @@ test("live request traces show the used Bearer token while stored traces redact 
     nested: [{ authorization: "Bearer secret-value", client_secret: "arbitrary-secret", clientToken: "private-sdk-token", access_token: "private-token", password: "another-password" }],
     payment_source: { paypal: { vault_id: "visible-vault-id" } },
   };
-  const paypal = new PayPal(settings, async (url) => url.endsWith("/v1/oauth2/token") ?
-    Response.json({ access_token: "server-access-token", expires_in: 300 }) :
-    Response.json(raw, { status: 201, headers: { "paypal-debug-id": "safe-debug", "set-cookie": "private-cookie" } }));
+  const paypal = new PayPal(settings, async (url, init) => {
+    if (url.endsWith("/v1/oauth2/token")) return Response.json({ access_token: "server-access-token", expires_in: 300 });
+    assert.equal(init.headers.Authorization, "Bearer server-access-token");
+    return Response.json(raw, { status: 201, headers: { "paypal-debug-id": "safe-debug", "set-cookie": "private-cookie" } });
+  });
   const result = await paypal.api("/v2/checkout/orders", {
     method: "POST", body: { intent: "CAPTURE", client_secret: "request-secret" }, requestId: "test-request", trace,
   });
@@ -196,14 +198,14 @@ test("live request traces show the used Bearer token while stored traces redact 
   assert.equal(trace.response.body.payment_source.paypal.vault_id, "visible-vault-id");
   assert.equal(trace.request.body.client_secret, "[REDACTED]");
   assert.equal(trace.response.headers["paypal-debug-id"], "safe-debug");
-  assert.deepEqual(trace.request.authentication, { method: "Bearer", token: "server-access-token" });
-  assert.equal(trace.request.headers.Authorization, "Bearer server-access-token");
+  assert.deepEqual(trace.request.authentication, { method: "Bearer", token: "[REDACTED]" });
+  assert.equal(trace.request.headers.Authorization, "[REDACTED]");
   assert.equal(trace.response.body.diagnostic.includes("server-access-token"), false);
   const stored = paypal.safeTrace(trace);
   assert.equal(stored.request.authentication.method, "Bearer");
   assert.equal(stored.request.authentication.token, "[REDACTED]");
   assert.equal(stored.request.headers.Authorization, "[REDACTED]");
-  const serialized = JSON.stringify(stored);
+  const serialized = JSON.stringify([trace, stored]);
   for (const secret of [settings.PAYPAL_CLIENT_SECRET, settings.BASIC_AUTH_PASSWORD, "server-access-token", "arbitrary-secret", "private-sdk-token", "private-token", "another-password", "request-secret", "private-cookie"]) {
     assert.equal(serialized.includes(secret), false, secret);
   }

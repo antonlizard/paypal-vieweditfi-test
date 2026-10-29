@@ -278,7 +278,6 @@ export class VaultStore {
     try {
       const result = await this.paypal.api(path, { ...init, trace });
       // Retain request/response history without retaining usable credentials.
-      // Only the response to this authenticated action contains the used token.
       operation.traces[kind] = this.paypal.safeTrace(trace);
       await this.storage.put(`operation:${operation.requestId}`, operation);
       return { order: result, trace };

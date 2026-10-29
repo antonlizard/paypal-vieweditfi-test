@@ -5,7 +5,6 @@ let cardFields, cardMounted = false, cardRendering, cardSubmitting = false, card
 let savePayPalChoice = false, saveCardChoice = false, savedCardAuthenticationUrl;
 let selectedMethod, renderNewPayPalButton, renderCardFields;
 const activity = [];
-const displayedAuthorizations = new Map();
 const context = () => flow === "new" ? "new" : `returning:${buyer?.revision}`;
 const storageKey = (kind) => `editfi:${kind === "card" ? flow : context()}:${kind}`;
 const placeOrderPrompt = 'Payment method approved. Click "Place order with saved method" to complete the purchase.';
@@ -24,7 +23,6 @@ function status(message, type = "") {
 }
 
 function resetApiTraces() {
-  displayedAuthorizations.clear();
   for (const kind of ["create", "confirm", "capture"]) {
     $(`${kind}-trace`).open = false;
     $(`${kind}-trace-status`).textContent = "Not requested";
@@ -40,15 +38,10 @@ function showApiTraces(traces) {
     $(`${kind}-trace`).open = true;
     $(`${kind}-trace-status`).textContent = trace.response ? `HTTP ${trace.response.status}` : trace.attempted ? "No response" : "Not sent";
     const request = { ...trace.request, headers: { ...trace.request.headers }, authentication: { ...trace.request.authentication } };
-    const key = `${request.url}:${request.headers["PayPal-Request-Id"]}`;
-    const token = request.authentication.token;
-    if (typeof token === "string" && token !== "[REDACTED]") displayedAuthorizations.set(key, token);
-    const usedToken = displayedAuthorizations.get(key);
-    if (usedToken) {
-      request.authentication.token = usedToken;
-      request.headers.Authorization = `Bearer ${usedToken}`;
-    } else if (request.authentication.token === "[REDACTED]") {
-      request.authentication.token = "Not retained. Send a new request to display its token.";
+    // Also mask legacy trace values; the page never retains an access token.
+    if ("token" in request.authentication) request.authentication.token = "[REDACTED]";
+    for (const name of Object.keys(request.headers)) {
+      if (name.toLowerCase() === "authorization") request.headers[name] = "[REDACTED]";
     }
     $(`${kind}-request`).textContent = JSON.stringify(request, null, 2);
     $(`${kind}-response`).textContent = JSON.stringify(trace.response || { error: trace.error || "No response received." }, null, 2);
@@ -93,7 +86,7 @@ function showError(error) {
   const extra = error.details?.debugId ? ` (PayPal debug ID: ${error.details.debugId})` : "";
   status(`${error.message}${extra}`, "error");
   const details = error.details ? { ...error.details } : undefined;
-  if (details) delete details.traces; // Tokens belong only in the request panel.
+  if (details) delete details.traces; // Request details have their own panels.
   log("Error", { code: error.code, message: error.message, details });
   controls();
 }

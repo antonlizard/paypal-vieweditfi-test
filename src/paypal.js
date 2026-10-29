@@ -173,8 +173,8 @@ export class PayPal {
     };
     if (trace) {
       // Trace only the explicit Orders calls requested by the caller. OAuth
-      // requests/responses are excluded. The used Bearer token is returned in
-      // the immediate debug response; callers redact it before persistence.
+      // requests/responses are excluded. Credentials are never included in
+      // traces, including immediate success and error responses.
       Object.assign(trace, {
         request: this.safeTrace({ method, url: this.settings.apiBase + path, headers, body: body ?? null }),
         response: null,
@@ -185,8 +185,8 @@ export class PayPal {
     try {
       const token = await this.token();
       if (trace) {
-        trace.request.authentication.token = token;
-        trace.request.headers.Authorization = `Bearer ${token}`;
+        trace.request.authentication.token = "[REDACTED]";
+        trace.request.headers.Authorization = "[REDACTED]";
       }
       return await this.request(path, {
         method,

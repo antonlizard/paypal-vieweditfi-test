@@ -257,6 +257,9 @@ test("saved cards use separate create/confirm calls with SCA_ALWAYS and capture 
   assert.match(created.body.order.payerActionUrl, /^https:\/\/www\.sandbox\.paypal\.com\//);
   assert.equal(new URL(created.body.order.payerActionUrl).searchParams.get("redirect_uri"), "https://test.example/returning-customer?saved-card=return");
   assert.equal(created.body.traces.create.request.body.payment_source, undefined);
+  assert.equal(JSON.stringify(created.body).includes("server-access-token"), false);
+  assert.deepEqual(created.body.traces.confirm.request.authentication, { method: "Bearer", token: "[REDACTED]" });
+  assert.equal(created.body.traces.confirm.request.headers.Authorization, "[REDACTED]");
   const source = created.body.traces.confirm.request.body.payment_source.card;
   assert.equal(source.vault_id, saved.vaultId);
   assert.equal(source.attributes.verification.method, "SCA_ALWAYS");
@@ -454,8 +457,8 @@ test("Orders traces preserve the actual REST requests and full responses across 
   assert.equal(create.request.url, "https://api-m.sandbox.paypal.com/v2/checkout/orders");
   assert.deepEqual(create.request.body, actual.body);
   assert.equal(create.request.headers["PayPal-Request-Id"], actual.headers["PayPal-Request-Id"]);
-  assert.equal(create.request.headers.Authorization, "Bearer server-access-token");
-  assert.deepEqual(create.request.authentication, { method: "Bearer", token: "server-access-token" });
+  assert.equal(create.request.headers.Authorization, "[REDACTED]");
+  assert.deepEqual(create.request.authentication, { method: "Bearer", token: "[REDACTED]" });
   assert.equal(create.response.status, 201);
   assert.equal(create.response.headers["paypal-debug-id"], "create-debug-id");
   assert.deepEqual(create.response.body, h.orders.get(id).result);
@@ -469,7 +472,8 @@ test("Orders traces preserve the actual REST requests and full responses across 
   assert.deepEqual(capture.response.body, JSON.parse(JSON.stringify(h.orders.get(id).result)));
   assert.equal(captured.body.traces.create.request.authentication.method, "Bearer");
   assert.equal(captured.body.traces.create.request.authentication.token, "[REDACTED]");
-  assert.equal(capture.request.authentication.token, "server-access-token");
+  assert.equal(capture.request.authentication.token, "[REDACTED]");
+  assert.equal(capture.request.headers.Authorization, "[REDACTED]");
   assert.deepEqual(captured.body.traces.create.response, create.response);
   h.restart();
   const recovered = await h.call(`/api/operations/${body.requestId}`);
@@ -483,7 +487,8 @@ test("Orders traces preserve the actual REST requests and full responses across 
   assert.deepEqual(replay.body.traces, recovered.body.traces);
   const serialized = JSON.stringify(captured.body.traces);
   for (const secret of [h.env.PAYPAL_CLIENT_SECRET, h.env.BASIC_AUTH_PASSWORD]) assert.equal(serialized.includes(secret), false);
-  assert.equal(serialized.includes("server-access-token"), true);
+  assert.equal(JSON.stringify(created.body).includes("server-access-token"), false);
+  assert.equal(serialized.includes("server-access-token"), false);
   assert.equal(JSON.stringify([...h.storage.map]).includes("server-access-token"), false);
   const token = await h.call("/api/client-token", { vaultRevision: buyer.revision });
   assert.equal(token.body.traces, undefined);
@@ -504,7 +509,8 @@ test("failed captures return and retain their HTTP trace without changing paymen
   assert.equal(traces.capture.response.status, 422);
   assert.equal(traces.capture.response.body.name, "UNPROCESSABLE_ENTITY");
   assert.deepEqual(traces.create.response, created.body.traces.create.response);
-  assert.equal(traces.capture.request.authentication.token, "server-access-token");
+  assert.equal(traces.capture.request.authentication.token, "[REDACTED]");
+  assert.equal(JSON.stringify(failed.body).includes("server-access-token"), false);
   const saved = (await h.call(`/api/operations/${key}`)).body.traces;
   assert.equal(saved.capture.request.authentication.token, "[REDACTED]");
   assert.deepEqual(saved.capture.response, traces.capture.response);
@@ -529,6 +535,7 @@ test("direct saved-method purchase auto-captures once, including duplicate click
   assert.equal(first.body.traces.create.response.status, 201);
   assert.equal(first.body.traces.create.request.body.payment_source.paypal.vault_id, buyer.vaultId);
   assert.equal(first.body.traces.capture, undefined);
+  assert.equal(JSON.stringify(first.body).includes("server-access-token"), false);
   assert.equal(h.calls.filter((call) => call.path.endsWith("/capture")).length, before);
   const payload = h.calls.filter((call) => call.path === "/v2/checkout/orders").at(-1).body;
   assert.equal(payload.payment_source.paypal.vault_id, buyer.vaultId);
