@@ -70,7 +70,19 @@ function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, has
           }
           if (options.cardConfirmWait) await options.cardConfirmWait;
           if (options.cardNoApproval) return;
-          await configuration.onApprove({ orderID, ...(options.cardApproval || {}) });
+          try {
+            await configuration.onApprove({ orderID, ...(options.cardApproval || {}) });
+          } catch (error) {
+            if (!options.wrapApprovalError) throw error;
+            // SDK/iframe boundaries do not preserve the merchant Error identity.
+            const wrapped = new Error(`SDK callback rejected: ${error.message}`);
+            configuration.onError(wrapped);
+            throw wrapped;
+          }
+          if (options.sdkErrorAfterApproval) {
+            configuration.onError(options.sdkErrorAfterApproval);
+            throw options.sdkErrorAfterApproval;
+          }
           if (options.duplicateCardApproval) await configuration.onApprove({ orderID });
         },
       };
@@ -835,6 +847,165 @@ test("a confirmed decline during capture enables a fresh card submission without
   assert.equal(page.element("save-card").disabled, false);
   assert.equal(page.element("card-submit").disabled, false);
   assert.equal(page.storage.has("editfi:new:card"), false);
+});
+
+for (const flow of ["new", "returning"]) {
+  test(`${flow} checkout preserves a backend 3DS rejection across SDK error wrapping without claiming capture was sent`, async () => {
+    const authentication = { liability_shift: "NO", three_d_secure: { enrollment_status: "Y", authentication_status: "N" } };
+    const order = { id: complete.id, status: "APPROVED", cardAuthenticated: false,
+      payment_source: { card: { authentication_result: authentication } } };
+    const page = browser(flow, (path) => {
+      if (path.endsWith("/capture")) return Response.json({ error: "CARD_AUTHENTICATION_REQUIRED",
+        message: "Complete successful 3D Secure authentication before capturing this card order.", details: {
+          order, captureRequested: false, debugId: "preflight-debug", traces: { get: {
+            request: { method: "GET", headers: {}, authentication: { method: "Bearer" } },
+            response: { status: 200, body: order }, attempted: true,
+          } },
+        } }, { status: 409 });
+    }, savedBuyer, true, { wrapApprovalError: true });
+    await page.ready();
+    await page.openCard();
+    await page.submitCard();
+    assert.match(page.element("status").textContent, /Complete successful 3D Secure authentication/);
+    assert.match(page.element("status").textContent, /preflight-debug/);
+    assert.match(page.element("status").textContent, /No capture was sent/);
+    assert.match(page.element("status").textContent, /3DS authentication status: N/);
+    assert.doesNotMatch(page.element("status").textContent, /capture result is uncertain/);
+    assert.equal(page.element("card-submit").disabled, false);
+    assert.equal(page.element("resume-card").hidden, true);
+    assert.equal(page.cardConfigurations.length, 1);
+    assert.match(page.element("activity").textContent, /"authenticationStatus": "N"/);
+  });
+}
+
+test("a lost capture response automatically restores its completed transaction without a second capture", async () => {
+  const page = browser("new", (path) => {
+    if (path.endsWith("/capture")) throw new Error("capture response lost");
+    if (path === `/api/orders/${complete.id}`) return { order: complete, captureRequested: true };
+  }, savedBuyer, true, { wrapApprovalError: true });
+  await page.ready();
+  await page.openCard();
+  await page.submitCard();
+  assert.match(page.element("status").textContent, /Card payment completed/);
+  assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+  assert.equal(page.element("check-status").hidden, true);
+  assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
+  assert.equal(page.requests.filter((request) => request.path === `/api/orders/${complete.id}`).length, 1);
+  assert.equal(page.cardConfigurations.length, 1);
+});
+
+test("a failed capture preflight releases the payment guard when the backend confirms no capture dispatch", async () => {
+  const page = browser("new", (path) => {
+    if (path.endsWith("/capture")) return Response.json({ error: "PAYPAL_UNREACHABLE", message: "PayPal order lookup timed out.",
+      details: { captureRequested: false, debugId: "lookup-debug" } }, { status: 502 });
+    if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "APPROVED", cardAuthenticated: true }, captureRequested: false };
+  });
+  await page.ready();
+  await page.openCard();
+  await page.submitCard();
+  assert.match(page.element("status").textContent, /PayPal order lookup timed out/);
+  assert.match(page.element("status").textContent, /No capture was sent/);
+  assert.equal(page.element("card-submit").disabled, false);
+  assert.equal(page.element("resume-card").hidden, false);
+  assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
+});
+
+test("a backend-confirmed unsent capture stays retryable even if its subsequent status check fails", async () => {
+  const page = browser("new", (path) => {
+    if (path.endsWith("/capture")) return Response.json({ error: "PAYPAL_UNREACHABLE", message: "PayPal order lookup timed out.",
+      details: { captureRequested: false } }, { status: 502 });
+    if (path === `/api/orders/${complete.id}`) throw new Error("status unavailable");
+  });
+  await page.ready();
+  await page.openCard();
+  await page.submitCard();
+  assert.match(page.element("status").textContent, /No capture was sent/);
+  assert.equal(page.element("card-submit").disabled, false);
+  assert.equal(page.element("resume-card").hidden, true);
+  await page.selectMethod("paypal");
+  await page.callbacks.createOrder();
+  assert.equal(page.requests.filter((request) => request.path === "/api/orders").length, 2);
+});
+
+test("an older capture response keeps its payment guard even without an attempted flag", async () => {
+  const page = browser("new", (path) => {
+    if (path.endsWith("/capture")) throw new Error("response lost");
+    if (path === `/api/orders/${complete.id}`) return { captureRequested: false,
+      order: { id: complete.id, status: "APPROVED", cardAuthenticated: true }, traces: { capture: {
+        request: captureTrace.request, response: { status: 422, body: { details: [{ issue: "ORDER_ALREADY_CAPTURED" }] } },
+      } } };
+  });
+  await page.ready();
+  await page.openCard();
+  await page.submitCard();
+  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("check-status").hidden, false);
+  assert.doesNotMatch(page.element("status").textContent, /No capture was sent/);
+  await page.submitCard();
+  assert.equal(page.requests.filter((request) => request.path === "/api/orders").length, 1);
+});
+
+test("a failed recovery preserves the original capture error and cannot be overwritten by a later SDK error", async () => {
+  let checks = 0;
+  const page = browser("new", (path) => {
+    if (path.endsWith("/capture")) return Response.json({ error: "PAYPAL_UNREACHABLE", message: "The capture request timed out.",
+      details: { captureRequested: true, debugId: "capture-debug" } }, { status: 502 });
+    if (path === `/api/orders/${complete.id}`) {
+      checks++;
+      if (checks === 1) throw new Error("lookup response lost");
+      return { order: complete, captureRequested: true };
+    }
+  }, savedBuyer, true, { sdkErrorAfterApproval: new Error("zoid iframe closed with private-sdk-token") });
+  await page.ready();
+  await page.openCard();
+  await page.submitCard();
+  assert.match(page.element("status").textContent, /The capture request timed out/);
+  assert.match(page.element("status").textContent, /capture-debug/);
+  assert.match(page.element("status").textContent, /Payment status could not be checked/);
+  assert.doesNotMatch(page.element("status").textContent, /capture result is uncertain/);
+  assert.doesNotMatch(page.element("activity").textContent, /private-sdk-token/);
+  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("check-status").hidden, false);
+  assert.equal(page.cardConfigurations.length, 1);
+  await page.element("check-status").events.click();
+  assert.match(page.element("status").textContent, /Card payment completed/);
+  assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
+});
+
+test("an SDK error while the merchant capture is pending cannot rebuild fields or release submission controls", async () => {
+  let release;
+  const page = browser("new", (path) => {
+    if (path.endsWith("/capture")) return new Promise((resolve) => { release = resolve; });
+  });
+  await page.ready();
+  await page.openCard();
+  const submitted = page.submitCard();
+  await new Promise((resolve) => setImmediate(resolve));
+  page.cardCallbacks.onError(new Error("zoid postMessage failed with private-sdk-token"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(page.cardConfigurations.length, 1);
+  assert.equal(page.element("save-card").disabled, true);
+  assert.equal(page.element("payment-methods").disabled, true);
+  assert.equal(page.element("card-submit").disabled, true);
+  assert.doesNotMatch(page.element("activity").textContent, /private-sdk-token/);
+  release({ order: complete });
+  await submitted;
+  assert.match(page.element("status").textContent, /Card payment completed/);
+});
+
+test("a completed capture stays successful when refreshing the saved method fails", async () => {
+  let states = 0;
+  const page = browser("new", (path) => {
+    if (path === "/api/state" && ++states > 1) return Response.json({ error: "INTERNAL_ERROR", message: "Saved method lookup failed." }, { status: 500 });
+  });
+  await page.ready();
+  await page.openCard();
+  await page.submitCard();
+  assert.match(page.element("status").textContent, /Card payment completed/);
+  assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+  assert.equal(page.element("check-status").hidden, true);
+  assert.match(page.element("activity").textContent, /Saved method refresh failed/);
+  assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
 });
 
 for (const flow of ["new", "returning"]) {

@@ -285,6 +285,7 @@ test("card captures reject failed, incomplete, attempted-only, or absent 3DS res
     h.mock.cardAuthenticationStatus = status;
     const result = await h.call(`/api/orders/${created.body.order.id}/capture`, { authentication_status: "Y" });
     assert.equal(result.body.error, "CARD_AUTHENTICATION_REQUIRED");
+    assert.equal(result.body.details.captureRequested, false);
     assert.equal(result.body.details.traces.get.request.method, "GET");
     assert.equal(result.body.details.traces.get.request.url.endsWith("?fields=payment_source"), true);
     assert.equal(result.body.details.traces.get.response.body.payment_source.card.authentication_result.three_d_secure.authentication_status, status);
@@ -294,6 +295,7 @@ test("card captures reject failed, incomplete, attempted-only, or absent 3DS res
   h.mock.cardAuthenticationStatus = "Y";
   const captured = await h.call(`/api/orders/${created.body.order.id}/capture`, {});
   assert.equal(captured.body.order.completed, true);
+  assert.equal(captured.body.captureRequested, true);
   assert.equal(captured.body.traces.get.response.body.payment_source.card.authentication_result.three_d_secure.authentication_status, "Y");
 });
 
@@ -302,6 +304,7 @@ test("Get Order details retain a redacted request and authentication result with
   const requestId = crypto.randomUUID();
   const created = await h.call("/api/orders", { flow: "card", page: "new", requestId });
   const result = await h.call(`/api/orders/${created.body.order.id}`);
+  assert.equal(result.body.captureRequested, false);
   assert.equal(result.body.traces.get.response.status, 200);
   assert.equal(result.body.traces.get.request.method, "GET");
   assert.equal(result.body.traces.get.request.headers.Authorization, "[REDACTED]");
@@ -347,6 +350,24 @@ test("capture intent is stored before dispatch so restart recovery does not depe
   h.restart();
   const recovered = await h.call(`/api/operations/${requestId}`);
   assert.equal(recovered.body.captureRequested, true);
+  assert.equal((await h.call(`/api/orders/${created.body.order.id}`)).body.captureRequested, true);
+});
+
+test("a failed capture exposes its dispatch marker in the error and later status without clearing it", async () => {
+  const h = harness();
+  const requestId = crypto.randomUUID();
+  const created = await h.call("/api/orders", { flow: "card", page: "new", requestId });
+  h.mock.failCapture = true;
+  const rejected = await h.call(`/api/orders/${created.body.order.id}/capture`, {});
+  assert.equal(rejected.body.error, "PAYPAL_API_ERROR");
+  assert.equal(rejected.body.details.captureRequested, true);
+  assert.equal(rejected.body.details.traces.capture.response.status, 422);
+  h.restart();
+  const checked = await h.call(`/api/orders/${created.body.order.id}`);
+  assert.equal(checked.body.captureRequested, true);
+  assert.equal(checked.body.traces.capture.response.status, 422);
+  assert.equal(h.calls.filter((call) => call.path.endsWith("/capture")).length, 1);
+  assert.equal(JSON.stringify(checked.body).includes("server-access-token"), false);
 });
 
 test("saved-card confirmation retries reuse the same order and idempotency key after a lost response", async () => {

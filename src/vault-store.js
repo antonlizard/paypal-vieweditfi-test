@@ -295,6 +295,7 @@ export class VaultStore {
         error.message = this.paypal.safeTrace(error.message);
         error.details = {
           ...this.paypal.safeTrace(error.details),
+          captureRequested: operation.captureRequested === true,
           traces: { ...operation.traces, [kind]: trace },
         };
       }
@@ -306,7 +307,8 @@ export class VaultStore {
     const operationKey = await this.storage.get(`order:${orderId}`);
     const operation = operationKey ? await this.storage.get(operationKey) : null;
     if (!operation) throw new AppError(404, "UNKNOWN_ORDER", "This order was not created by this test application.");
-    if (capture && operation.result?.completed) return json({ order: operation.result, traces: operation.traces || {}, replayed: true });
+    if (capture && operation.result?.completed) return json({ order: operation.result,
+      captureRequested: operation.captureRequested === true, traces: operation.traces || {}, replayed: true });
     if (capture && ["returning", "direct", "saved-card"].includes(operation.flow)) await this.current(operation.vaultRevision);
     if (capture && operation.flow === "direct") {
       throw new AppError(409, "DIRECT_ORDER", "Direct charges are processed by create order. Check their status instead of capturing again.");
@@ -319,13 +321,14 @@ export class VaultStore {
       if (isCompleted(verified)) {
         operation.result = summary(verified, operation);
         await this.finish(operation, verified);
-        return json({ order: operation.result, flow: operation.flow, traces: operation.traces || {}, replayed: true });
+        return json({ order: operation.result, flow: operation.flow, captureRequested: operation.captureRequested === true,
+          traces: operation.traces || {}, replayed: true });
       }
       if (verified.status !== "APPROVED" || !cardAuthenticated(verified)) {
         operation.result = summary(verified, operation);
         await this.finish(operation, verified);
         throw new AppError(409, "CARD_AUTHENTICATION_REQUIRED", "Complete successful 3D Secure authentication before capturing this card order.", {
-          order: operation.result, traces: operation.traces || {},
+          order: operation.result, captureRequested: operation.captureRequested === true, traces: operation.traces || {},
         });
       }
     }
@@ -339,6 +342,7 @@ export class VaultStore {
     return json({
       order: operation.result,
       flow: operation.flow,
+      captureRequested: operation.captureRequested === true,
       traces: { ...operation.traces, ...(captured ? { capture: captured.trace } : {}) },
       buyer: publicBuyer(await this.storage.get("current")),
     });

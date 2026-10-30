@@ -175,11 +175,17 @@ async function finish(result) {
   paid = order.completed === true;
   unresolved = !paid;
   busy = false;
-  const current = await api("/api/state");
-  showBuyer(current.buyer);
+  let current;
+  try {
+    current = await api("/api/state");
+    showBuyer(current.buyer);
+  } catch (error) {
+    // Refreshing the shared saved method cannot change a confirmed payment.
+    log("Saved method refresh failed", { code: error.code, message: error.message });
+  }
   if (paid) {
     const saving = flow === "new" && (activeMethod === "card" ? saveCardChoice : savePayPalChoice);
-    status(`${activeMethod.includes("card") ? "Card payment" : "Payment"} completed. Order ${order.id}.${saving && current.buyer?.state !== "VAULTED" ? " Vaulting is pending; refresh the saved method before using it." : ""}`, "success");
+    status(`${activeMethod.includes("card") ? "Card payment" : "Payment"} completed. Order ${order.id}.${saving && current && current.buyer?.state !== "VAULTED" ? " Vaulting is pending; refresh the saved method before using it." : ""}`, "success");
   } else {
     status(`Order ${order.id}: ${order.status}. Payment is not confirmed. Check its status before starting another purchase.`);
   }
@@ -188,6 +194,11 @@ async function finish(result) {
 
 function hasCapture(order) {
   return order.purchase_units?.some((unit) => unit.payments?.captures?.length);
+}
+
+function noCardCapture(result) {
+  return result?.captureRequested === false && !hasCapture(result.order || {}) &&
+    !result.traces?.capture?.attempted && !result.traces?.capture?.response;
 }
 
 function failedCardPayment(order, traces) {
@@ -262,7 +273,8 @@ async function onApprove(data) {
 }
 
 async function captureOrder(orderID) {
-  if (activeMethod.includes("card")) {
+  const cardPayment = activeMethod.includes("card");
+  if (cardPayment) {
     cardCaptureAttempted = true;
     approvedCardOrderId = undefined;
     savedCardAuthenticationUrl = undefined;
@@ -276,15 +288,66 @@ async function captureOrder(orderID) {
   try {
     await finish(await api(`/api/orders/${encodeURIComponent(orderID)}/capture`, {}));
   } catch (error) {
+    if (cardPayment) {
+      // Handle merchant API failures here instead of rejecting the SDK's
+      // onApprove callback. SDK wrappers otherwise replace the original error
+      // and can incorrectly report a failed preflight as an unknown capture.
+      await recoverCardCapture(orderID, error);
+      if (error.code === "BUYER_CHANGED") {
+        approvedCardOrderId = savedCardAuthenticationUrl = undefined;
+        $("checkout-controls").hidden = true;
+      }
+      return;
+    }
     // An interrupted capture might still have settled at PayPal. Block another
     // purchase and offer status recovery instead of creating a second charge.
     unresolved = !paid && error.code !== "BUYER_CHANGED";
-    if (error.code === "CARD_AUTHENTICATION_REQUIRED") cardCaptureAttempted = false;
     showError(error);
     if (error.code === "BUYER_CHANGED") $("checkout-controls").hidden = true;
     throw error;
   } finally {
     submittingPayment = false;
+    controls();
+  }
+}
+
+async function recoverCardCapture(orderID, error) {
+  showError(error); // Keep the original backend code, details, and debug ID.
+  busy = true;
+  controls();
+  status("Checking the card payment result with PayPal…");
+  const extra = error.details?.debugId ? ` (PayPal debug ID: ${error.details.debugId})` : "";
+  try {
+    // Authentication rejections and definitive declines already include the
+    // verified order. Other failures get one read-only check, never a capture.
+    const verified = error.details?.order || error.details?.traces?.get?.response?.body;
+    const knownResult = verified && ((error.code === "CARD_AUTHENTICATION_REQUIRED" && error.details.captureRequested === false) ||
+      failedCardPayment(verified, error.details.traces));
+    const result = knownResult ?
+      { order: verified, traces: error.details.traces, captureRequested: error.details.captureRequested } :
+      await api(`/api/orders/${encodeURIComponent(orderID)}`);
+    await restoreCard(result);
+    log("Card capture status recovery", { orderID, errorCode: error.code,
+      status: result.order.status, completed: result.order.completed === true,
+      captureRequested: result.captureRequested });
+    if (!paid) {
+      const authentication = result.order.payment_source?.card?.authentication_result?.three_d_secure?.authentication_status;
+      const secure = /^[YNURACDI]$/.test(authentication || "") ? `3DS authentication status: ${authentication}. ` : "";
+      status(`${error.message}${extra} ${noCardCapture(result) ? "No capture was sent. " : ""}${secure}${$("status").textContent}`, "error");
+    }
+  } catch (lookupError) {
+    // A failed read does not prove the payment failed. Keep the same order/key
+    // and guard against another payment until its status can be confirmed.
+    const noCapture = noCardCapture(error.details);
+    unresolved = !paid && !noCapture;
+    cardInterrupted = !paid;
+    if (noCapture) cardCaptureAttempted = false;
+    busy = false;
+    log("Card capture status check failed", { orderID, code: lookupError.code,
+      message: lookupError.message, debugId: lookupError.details?.debugId });
+    status(`${error.message}${extra} Payment status could not be checked. ${noCapture ?
+      "No capture was sent. You can retry checkout or choose another payment method." :
+      "Check payment status before submitting another payment."}`, "error");
     controls();
   }
 }
@@ -632,7 +695,9 @@ function resetInterruptedCard(session, captureUncertain) {
 
 function cardError(error, callback = "sdk-onError", session = cardSession) {
   if (paid) return;
-  const ignored = !session || session !== cardSession || session.interrupted;
+  // Once approval hands off to the backend, captureOrder owns the result and
+  // recovery. Late iframe errors must not reset fields or replace that result.
+  const ignored = !session || session !== cardSession || session.interrupted || session.approvalHandled === true;
   const safe = error && typeof error === "object" && backendErrors.has(error) ? error : new Error(
     session?.orderID ? "Card submission was interrupted. You can edit the card or choose another method. Check payment status for the 3DS result." :
       "Card payment could not be submitted. Review the card fields, then retry.",
@@ -643,17 +708,8 @@ function cardError(error, callback = "sdk-onError", session = cardSession) {
   }
   log("CardFields error 3DS result", { source: "frontend", callback, orderID: session?.orderID, ignored, ...cardSdkDiagnostic(error) });
   if (ignored || cardCancelled) return;
-  const verifiedOrder = safe.details?.traces?.get?.response?.body;
-  const declined = backendErrors.has(safe) && verifiedOrder && failedCardPayment(verifiedOrder, safe.details.traces);
-  const captureUncertain = session.stage === "capture" && safe.code !== "CARD_AUTHENTICATION_REQUIRED" && !declined;
-  if (declined) {
-    cardNeedsNewOrder = true;
-    cardCaptureAttempted = false;
-    sessionStorage.removeItem(storageKey("card"));
-  }
-  if (captureUncertain && safe.code === "CARD_SDK_ERROR") safe.message = "The capture result is uncertain. Check payment status before submitting another payment. You can still edit or switch methods.";
   showError(safe);
-  resetInterruptedCard(session, captureUncertain);
+  resetInterruptedCard(session, false);
 }
 
 function onCardCancel(session) {
@@ -687,10 +743,11 @@ function initializeCardFields(paypal) {
       createOrder: () => createCardOrder(session),
       onApprove(data) {
         const ignored = paid || session !== cardSession || session.interrupted || unresolved || cardCancelled ||
-          activeMethod !== "card" || !cardSubmitting || data.orderID !== session.orderID;
+          activeMethod !== "card" || !cardSubmitting || data.orderID !== session.orderID || session.approvalHandled === true;
         log("CardFields.onApprove 3DS result", { source: "frontend", orderID: session.orderID, ignored, ...frontendCardResult(data) });
         if (ignored) return;
         if (!cardCapturePromise) {
+          session.approvalHandled = true;
           cardStage = session.stage = "capture";
           approvedCardOrderId = data.orderID;
           cardCapturePromise = captureOrder(data.orderID).finally(() => { cardCapturePromise = undefined; });
@@ -751,7 +808,9 @@ async function restoreCard(result, method = activeMethod.includes("card") ? acti
   savedCardAuthenticationUrl = method === "saved-card" ? result.order.payerActionUrl : undefined;
   // A confirmed unapproved order can be retried with the SAME create key. A
   // previous capture attempt always keeps the checkout locked for recovery.
-  const captureAttempted = cardCaptureAttempted || result.traces?.capture?.attempted;
+  const captureAttempted = result.captureRequested === true || result.traces?.capture?.attempted || result.traces?.capture?.response ||
+    (result.captureRequested !== false && cardCaptureAttempted);
+  cardCaptureAttempted = Boolean(captureAttempted);
   const retryable = failed || (!captureAttempted && (method === "card" ? ["CREATED", "SAVED", "APPROVED", "PAYER_ACTION_REQUIRED"].includes(result.order.status) :
     ["CREATED", "PAYER_ACTION_REQUIRED"].includes(result.order.status)));
   cardNeedsNewOrder = retryable && !["CREATED", "PAYER_ACTION_REQUIRED"].includes(result.order.status);
@@ -777,6 +836,8 @@ $("card-form").addEventListener("submit", async (event) => {
   const fields = cardFields;
   if (!session) return;
   cardStage = session.stage = "validation";
+  session.approvalHandled = false;
+  session.orderID = undefined;
   cardCancelled = false;
   busy = submittingPayment = cardSubmitting = true;
   controls();
@@ -807,7 +868,7 @@ $("card-form").addEventListener("submit", async (event) => {
     const ignored = session !== cardSession || session.interrupted;
     log("CardFields.submit 3DS result", { source: "frontend", orderID: session.orderID, ignored, ...frontendCardResult(result) });
     if (ignored) return;
-    if (!paid && !unresolved && cardOrderId) {
+    if (!paid && !unresolved && cardOrderId && !session.approvalHandled) {
       // A resolved submit without onApprove is not proof of capture. Read the
       // order rather than freezing checkout on an assumed unknown payment.
       await restoreCard(await api(`/api/orders/${encodeURIComponent(cardOrderId)}`), "card");
