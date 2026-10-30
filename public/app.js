@@ -783,9 +783,22 @@ function initializeCardFields(paypal) {
     cardFields = paypal.CardFields({
       createOrder: () => createCardOrder(session),
       onApprove(data) {
-        const ignored = paid || session !== cardSession || session.interrupted || unresolved || cardCancelled ||
-          activeMethod !== "card" || !cardSubmitting || data.orderID !== session.orderID || session.approvalHandled === true;
-        log("CardFields.onApprove 3DS result", { source: "frontend", orderID: session.orderID, ignored, ...frontendCardResult(data) });
+        // Approval belongs to the current order/session, not to the lifetime
+        // of submit()'s promise. The SDK can deliver onApprove after it settles.
+        const ignoreReasons = [
+          paid && "PAYMENT_ALREADY_COMPLETED",
+          session !== cardSession && "STALE_COMPONENT",
+          session.interrupted && "INTERRUPTED",
+          unresolved && "PAYMENT_RESULT_UNRESOLVED",
+          cardCancelled && "CANCELLED",
+          activeMethod !== "card" && "OTHER_ACTIVE_METHOD",
+          flow === "new" && selectedMethod !== "card" && "OTHER_SELECTED_METHOD",
+          (!session.orderID || data.orderID !== session.orderID || cardOrderId !== session.orderID) && "ORDER_MISMATCH",
+          session.approvalHandled === true && "APPROVAL_ALREADY_HANDLED",
+        ].filter(Boolean);
+        const ignored = ignoreReasons.length > 0;
+        log("CardFields.onApprove 3DS result", { source: "frontend", orderID: session.orderID, ignored, ignoreReasons,
+          backendCaptureRequest: ignored ? "NOT_REQUESTED" : "REQUESTED", ...frontendCardResult(data) });
         if (ignored) return;
         if (!cardCapturePromise) {
           session.approvalHandled = true;
@@ -913,7 +926,19 @@ $("card-form").addEventListener("submit", async (event) => {
     if (!paid && !unresolved && cardOrderId && !session.approvalHandled) {
       // A resolved submit without onApprove is not proof of capture. Read the
       // order rather than freezing checkout on an assumed unknown payment.
-      await restoreCard(await api(`/api/orders/${encodeURIComponent(cardOrderId)}`), "card");
+      const orderID = cardOrderId;
+      try {
+        const result = await api(`/api/orders/${encodeURIComponent(orderID)}`);
+        // A late approval may have started/completed capture during this read.
+        // That handler owns the payment result; an earlier GET cannot replace it.
+        if (session === cardSession && !session.interrupted && !session.approvalHandled && !paid && cardOrderId === orderID) {
+          await restoreCard(result, "card");
+        }
+      } catch (error) {
+        // Failure of a merchant lookup is not an SDK/3DS failure. Preserve the
+        // instance so a valid approval delivered afterward can still capture.
+        if (session === cardSession && !session.interrupted && !session.approvalHandled && !paid) showError(error);
+      }
     }
   } catch (error) { if (!paid) cardError(error, "submit-rejected", session); }
   finally {

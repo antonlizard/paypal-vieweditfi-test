@@ -268,7 +268,10 @@ test("saved cards use separate create/confirm calls with SCA_ALWAYS and capture 
   assert.equal(source.attributes.verification.method, "SCA_ALWAYS");
   assert.deepEqual(source.stored_credential, { payment_initiator: "CUSTOMER", payment_type: "ONE_TIME", usage: "SUBSEQUENT" });
   const before = h.calls.filter((call) => call.path.endsWith("/capture")).length;
-  assert.equal((await h.call(`/api/orders/${created.body.order.id}/capture`, { cardAuthenticated: true })).body.error, "CARD_AUTHENTICATION_REQUIRED");
+  const unapproved = await h.call(`/api/orders/${created.body.order.id}/capture`, { cardAuthenticated: true });
+  assert.equal(unapproved.body.error, "CARD_AUTHENTICATION_REQUIRED");
+  assert.deepEqual(unapproved.body.details.captureCheck, { reason: "ORDER_NOT_APPROVED", orderStatus: "PAYER_ACTION_REQUIRED",
+    liabilityShift: null, authenticationStatus: null });
   assert.equal(h.calls.filter((call) => call.path.endsWith("/capture")).length, before);
   h.mock.savedCardApproved = true;
   const status = await h.call(`/api/orders/${created.body.order.id}`);
@@ -286,6 +289,8 @@ test("card captures reject failed, incomplete, attempted-only, or absent 3DS res
     const result = await h.call(`/api/orders/${created.body.order.id}/capture`, { authentication_status: "Y" });
     assert.equal(result.body.error, "CARD_AUTHENTICATION_REQUIRED");
     assert.equal(result.body.details.captureRequested, false);
+    assert.deepEqual(result.body.details.captureCheck, { reason: "THREE_DS_NOT_SUCCESSFUL", orderStatus: "APPROVED",
+      liabilityShift: "POSSIBLE", authenticationStatus: status ?? null });
     assert.equal(result.body.details.traces.get.request.method, "GET");
     assert.equal(result.body.details.traces.get.request.url.endsWith("?fields=payment_source"), true);
     assert.equal(result.body.details.traces.get.response.body.payment_source.card.authentication_result.three_d_secure.authentication_status, status);

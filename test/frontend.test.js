@@ -822,6 +822,83 @@ test("a resolved SDK submit without approval checks the order and leaves uncaptu
   assert.equal(page.element("card-submit").disabled, false);
 });
 
+for (const flow of ["new", "returning"]) {
+  test(`${flow} POSSIBLE approval arriving after submit settles captures its current card order exactly once`, async () => {
+    const page = browser(flow, (path) => {
+      if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "APPROVED", cardAuthenticated: true }, captureRequested: false };
+    }, savedBuyer, true, { cardNoApproval: true });
+    await page.ready();
+    await page.openCard();
+    await page.submitCard();
+    assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+    await page.cardCallbacks.onApprove({ orderID: complete.id, liabilityShift: "POSSIBLE" });
+    await page.cardCallbacks.onApprove({ orderID: complete.id, liabilityShift: "POSSIBLE" });
+    assert.equal(page.requests.filter((request) => request.path === `/api/orders/${complete.id}/capture`).length, 1);
+    assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+  });
+}
+
+test("a late POSSIBLE approval cannot capture a card after the buyer selects PayPal", async () => {
+  const page = browser("new", (path) => {
+    if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "APPROVED", cardAuthenticated: true }, captureRequested: false };
+  }, savedBuyer, true, { cardNoApproval: true });
+  await page.ready();
+  await page.openCard();
+  await page.submitCard();
+  await page.selectMethod("paypal");
+  await page.cardCallbacks.onApprove({ orderID: complete.id, liabilityShift: "POSSIBLE" });
+  assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+  assert.match(page.element("activity").textContent, /OTHER_SELECTED_METHOD/);
+});
+
+test("a stale order approval cannot capture a later card attempt", async () => {
+  let creates = 0;
+  const page = browser("new", (path) => {
+    if (path === "/api/orders") return { order: { id: ++creates === 1 ? complete.id : "ORDER00002", status: "PAYER_ACTION_REQUIRED" } };
+    if (path === `/api/orders/${complete.id}` || path === "/api/orders/ORDER00002") return { order: {
+      id: path.split("/").at(-1), status: "APPROVED", cardAuthenticated: true }, captureRequested: false };
+  }, savedBuyer, true, { cardNoApproval: true });
+  await page.ready();
+  await page.openCard();
+  await page.submitCard();
+  await page.submitCard();
+  await page.cardCallbacks.onApprove({ orderID: complete.id, liabilityShift: "POSSIBLE" });
+  assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+  assert.match(page.element("activity").textContent, /ORDER_MISMATCH/);
+});
+
+test("a late POSSIBLE approval survives a failed read-only lookup after SDK submit", async () => {
+  const page = browser("new", (path) => {
+    if (path === `/api/orders/${complete.id}`) throw new Error("lookup response lost");
+  }, savedBuyer, true, { cardNoApproval: true });
+  await page.ready();
+  await page.openCard();
+  const callbacks = page.cardCallbacks;
+  await page.submitCard();
+  assert.equal(page.cardConfigurations.length, 1);
+  await callbacks.onApprove({ orderID: complete.id, liabilityShift: "POSSIBLE" });
+  assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
+  assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+});
+
+test("a lookup started before a late approval cannot overwrite the completed capture", async () => {
+  let releaseLookup;
+  const page = browser("new", (path) => {
+    if (path === `/api/orders/${complete.id}`) return new Promise((resolve) => { releaseLookup = resolve; });
+  }, savedBuyer, true, { cardNoApproval: true });
+  await page.ready();
+  await page.openCard();
+  const submitted = page.submitCard();
+  await new Promise((resolve) => setImmediate(resolve));
+  await page.cardCallbacks.onApprove({ orderID: complete.id, liabilityShift: "POSSIBLE" });
+  const receipt = page.element("status").textContent;
+  releaseLookup({ order: { id: complete.id, status: "APPROVED", cardAuthenticated: true }, captureRequested: false });
+  await submitted;
+  assert.equal(page.element("status").textContent, receipt);
+  assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+  assert.equal(page.element("resume-card").hidden, true);
+});
+
 test("an already-captured API issue cannot be treated as a declined payment", async () => {
   const page = browser("new", (path) => {
     if (path.startsWith("/api/operations/")) return { flow: "card", savePaymentMethod: false, order: { id: complete.id } };

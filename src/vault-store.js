@@ -327,8 +327,15 @@ export class VaultStore {
       if (verified.status !== "APPROVED" || !cardAuthenticated(verified)) {
         operation.result = summary(verified, operation);
         await this.finish(operation, verified);
+        const authentication = verified.payment_source?.card?.authentication_result;
         throw new AppError(409, "CARD_AUTHENTICATION_REQUIRED", "Complete successful 3D Secure authentication before capturing this card order.", {
           order: operation.result, captureRequested: operation.captureRequested === true, traces: operation.traces || {},
+          captureCheck: {
+            reason: verified.status !== "APPROVED" ? "ORDER_NOT_APPROVED" : "THREE_DS_NOT_SUCCESSFUL",
+            orderStatus: verified.status ?? null,
+            liabilityShift: authentication?.liability_shift ?? null,
+            authenticationStatus: authentication?.three_d_secure?.authentication_status ?? null,
+          },
         });
       }
     }
