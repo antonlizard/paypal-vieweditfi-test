@@ -32,7 +32,8 @@
                 <p class="field-label">Cardholder name</p><div id="card-name-field" class="card-field"></div>
                 <p class="field-label">Card number</p><div id="card-number-field" class="card-field"></div>
                 <div class="card-field-row"><div><p class="field-label">Expiry date</p><div id="card-expiry-field" class="card-field"></div></div><div><p class="field-label">Security code</p><div id="card-cvv-field" class="card-field"></div></div></div>
-                <button id="card-submit" class="button primary" type="submit" disabled>Pay by card <span data-amount>—</span></button>
+                <p id="card-action-hint" class="supporting card-action-hint" role="status" hidden></p>
+                <button id="card-submit" class="button primary" type="submit" aria-describedby="card-action-hint" disabled><span id="card-submit-label">Pay by card</span><span id="card-submit-amount" data-amount>—</span></button>
                 <p class="component-note">PayPal securely collects your card details. Using a different card here preserves your saved payment method.</p>
               </form>
             </details>

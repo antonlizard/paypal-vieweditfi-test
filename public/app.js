@@ -9,6 +9,7 @@ let cardSession, cardFieldElements = [], cardInterrupted = false;
 let cardCaptureAttempted = false;
 let cardNeedsNewOrder = false;
 let recoveryNotice, recoveryAttempted = false;
+let checkingPaymentStatus = false, lastCardControlState;
 const activity = [];
 const backendErrors = new WeakSet();
 const context = () => flow === "new" ? "new" : `returning:${buyer?.revision}`;
@@ -66,8 +67,24 @@ function showApiTraces(traces) {
   }
 }
 
+function cardButtonState() {
+  if (paid) return { action: "paid", disabled: true, label: "Payment completed", hint: "" };
+  if (busy || submittingPayment || cardSubmitting || checkingPaymentStatus) return { action: "processing", disabled: true,
+    label: checkingPaymentStatus ? "Checking payment status…" : "Processing payment…",
+    hint: checkingPaymentStatus ? "Checking the previous payment result." : "Please wait for the current payment to finish." };
+  if (unresolved) {
+    if (activeMethod === "card" && approvedCardOrderId) return { action: "capture", disabled: false,
+      label: "Complete approved card payment", hint: `This completes order ${approvedCardOrderId} using the card already approved with 3D Secure.` };
+    return { action: "check", disabled: false, label: "Check previous payment",
+      hint: `Check the previous payment${lastOrderId ? ` (order ${lastOrderId})` : ""} before starting another purchase.` };
+  }
+  if (!cardMounted) return { action: "loading", disabled: true, label: "Loading card fields…",
+    hint: "Waiting for secure card fields to finish loading." };
+  return { action: "pay", disabled: false, label: "Pay by card", hint: "" };
+}
+
 function controls() {
-  const processing = busy || submittingPayment || cardSubmitting;
+  const processing = busy || submittingPayment || cardSubmitting || checkingPaymentStatus;
   const locked = processing || paid || unresolved;
   if (flow === "new") {
     $("payment-methods").disabled = processing || paid;
@@ -80,7 +97,21 @@ function controls() {
   // Only payment submission is blocked when a capture result is uncertain.
   $("alternative-controls").inert = paid;
   if ($("other-paypal-option")) $("other-paypal-option").inert = locked;
-  $("card-submit").disabled = locked || !cardMounted;
+  const cardButton = cardButtonState();
+  $("card-submit").disabled = cardButton.disabled;
+  $("card-submit").dataset.action = cardButton.action;
+  $("card-submit-label").textContent = cardButton.label;
+  $("card-submit-amount").hidden = cardButton.action !== "pay";
+  $("card-action-hint").textContent = cardButton.hint;
+  $("card-action-hint").hidden = !cardButton.hint;
+  const cardControl = { action: cardButton.action, disabled: cardButton.disabled,
+    busy, submittingPayment, cardSubmitting, checkingPaymentStatus, cardMounted, unresolved, paid,
+    orderID: lastOrderId || null, stage: cardSession?.stage || "idle" };
+  const signature = JSON.stringify(cardControl);
+  if (lastCardControlState !== signature) {
+    lastCardControlState = signature;
+    log("Card checkout state", cardControl);
+  }
   $("resume-card").hidden = paid || !approvedCardOrderId;
   $("resume-card").disabled = busy || submittingPayment || cardSubmitting;
   if ($("authenticate-saved-card")) {
@@ -89,6 +120,7 @@ function controls() {
   }
   for (const id of ["save-paypal", "save-card"]) if ($(id)) $(id).disabled = processing || paid;
   $("check-status").hidden = paid || (!unresolved && !cardInterrupted);
+  $("check-status").disabled = processing || paid;
   $("success-actions").hidden = !paid;
   if (paid) {
     container.hidden = true;
@@ -804,7 +836,8 @@ async function restoreCard(result, method = activeMethod.includes("card") ? acti
     ...(/^[YNURABCID]$/.test(threeDS?.authentication_status || "") ? { authenticationStatus: threeDS.authentication_status } : {}),
     ...(/^[YNU]$/.test(threeDS?.enrollment_status || "") ? { enrollmentStatus: threeDS.enrollment_status } : {}),
   });
-  approvedCardOrderId = result.order.status === "APPROVED" && result.order.cardAuthenticated === true ? result.order.id : undefined;
+  const alreadyCaptured = result.traces?.capture?.response?.body?.details?.some((detail) => detail.issue === "ORDER_ALREADY_CAPTURED");
+  approvedCardOrderId = !alreadyCaptured && result.order.status === "APPROVED" && result.order.cardAuthenticated === true ? result.order.id : undefined;
   savedCardAuthenticationUrl = method === "saved-card" ? result.order.payerActionUrl : undefined;
   // A confirmed unapproved order can be retried with the SAME create key. A
   // previous capture attempt always keeps the checkout locked for recovery.
@@ -831,7 +864,10 @@ async function restoreCard(result, method = activeMethod.includes("card") ? acti
 $("card-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   if (flow === "new" && selectedMethod !== "card") return;
-  if (busy || paid || unresolved || submittingPayment || cardSubmitting || !cardMounted) return;
+  const action = cardButtonState();
+  if (action.disabled) return;
+  if (action.action === "check") return checkPaymentStatus({ readOnly: true });
+  if (action.action === "capture") return captureOrder(approvedCardOrderId).catch(() => {});
   const session = cardSession;
   const fields = cardFields;
   if (!session) return;
@@ -968,8 +1004,9 @@ $("place-order")?.addEventListener("click", async () => {
   }
 });
 
-$("check-status").addEventListener("click", async () => {
-  if (busy) return;
+async function checkPaymentStatus({ readOnly = false } = {}) {
+  if (busy || paid || submittingPayment || cardSubmitting || checkingPaymentStatus) return;
+  checkingPaymentStatus = true;
   busy = true;
   controls();
   try {
@@ -983,12 +1020,13 @@ $("check-status").addEventListener("click", async () => {
         await finish(result);
       }
     } else {
-      if (activeMethod.includes("card")) {
+      if (activeMethod.includes("card") || readOnly) {
         recoveryNotice = undefined;
-        await recoverAttempt();
+        const found = await recoverAttempt();
         busy = false;
         controls();
         if (recoveryNotice) status(recoveryNotice.message, recoveryNotice.type);
+        else if (!found && unresolved) status("The previous payment has no confirmed order result yet. Check payment status again before starting another purchase.");
         return;
       }
       // Recover a direct-charge response lost before the order ID arrived.
@@ -999,7 +1037,13 @@ $("check-status").addEventListener("click", async () => {
     }
   }
   catch (error) { showError(error); }
-});
+  finally {
+    checkingPaymentStatus = busy = false;
+    controls();
+  }
+}
+
+$("check-status").addEventListener("click", () => checkPaymentStatus());
 
 $("refresh-vault").addEventListener("click", async () => {
   if (busy || unresolved) return;

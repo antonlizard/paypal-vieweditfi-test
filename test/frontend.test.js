@@ -35,7 +35,7 @@ function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, has
   let callbacks, cardCallbacks;
   function element(id) {
     if (!elements.has(id)) elements.set(id, {
-      hidden: false, disabled: false, open: false, checked: false, value: "", textContent: "", className: "", events: {},
+      hidden: false, disabled: false, open: false, checked: false, value: "", textContent: "", className: "", dataset: {}, events: {},
       addEventListener(event, handler) { this.events[event] = handler; },
       querySelector(selector) { return element(`${id}:${selector}`); },
       setAttribute(name, value) { this[name] = value; },
@@ -50,7 +50,7 @@ function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, has
     CardFields(configuration) {
       cardConfigurations.push(configuration);
       cardCallbacks = configuration;
-      const render = () => ({ async render(selector) { cardRenders.push(selector); }, async close() { closedFields.push(true); } });
+      const render = () => ({ async render(selector) { cardRenders.push(selector); await options.cardRenderWait; }, async close() { closedFields.push(true); } });
       return {
         isEligible: () => options.cardEligible !== false,
         NameField: render, NumberField: render, ExpiryField: render, CVVField: render,
@@ -542,7 +542,8 @@ test("a lost card capture response checks status without charging again and allo
   await page.openCard();
   await page.submitCard();
   assert.equal(page.element("check-status").hidden, false);
-  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("card-submit").disabled, false);
+  assert.equal(page.element("card-submit").dataset.action, "capture");
   await page.element("check-status").events.click();
   assert.equal(captures, 1);
   assert.equal(page.element("resume-card").hidden, false);
@@ -553,7 +554,7 @@ test("a lost card capture response checks status without charging again and allo
 
 test("a pending card capture cannot be submitted again using the approval recovery button", async () => {
   const page = browser("new", (path) => {
-    if (path.endsWith("/capture")) return { order: {
+    if (path.endsWith("/capture") || path === `/api/orders/${complete.id}`) return { order: {
       id: complete.id, status: "COMPLETED", completed: false,
       purchase_units: [{ payments: { captures: [{ id: "PENDING00001", status: "PENDING" }] } }],
     } };
@@ -562,9 +563,11 @@ test("a pending card capture cannot be submitted again using the approval recove
   await page.openCard();
   await page.submitCard();
   assert.equal(page.element("resume-card").hidden, true);
-  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("card-submit").disabled, false);
+  assert.equal(page.element("card-submit").dataset.action, "check");
   assert.equal(page.element("check-status").hidden, false);
   await page.element("resume-card").events.click();
+  await page.submitCard(); // The primary action checks status, not a new payment.
   assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
 });
 
@@ -736,7 +739,8 @@ test("an uncertain capture allows method selection and card editing while guardi
   await page.submitCard();
   assert.equal(page.element("payment-methods").disabled, false);
   assert.equal(page.element("alternative-controls").inert, false);
-  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("card-submit").disabled, false);
+  assert.equal(page.element("card-submit").dataset.action, "capture");
   await page.selectMethod("paypal");
   assert.equal(page.element("checkout-controls").hidden, false);
   assert.equal(page.element("checkout-controls").inert, true);
@@ -832,7 +836,8 @@ test("an already-captured API issue cannot be treated as a declined payment", as
   await page.ready();
   await page.openCard();
   assert.equal(page.element("save-card").disabled, false);
-  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("card-submit").disabled, false);
+  assert.equal(page.element("card-submit").dataset.action, "check");
   await page.submitCard();
   assert.equal(page.requests.some((request) => request.path === "/api/orders"), false);
 });
@@ -944,7 +949,9 @@ test("an older capture response keeps its payment guard even without an attempte
   await page.ready();
   await page.openCard();
   await page.submitCard();
-  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("card-submit").disabled, false);
+  assert.equal(page.element("card-submit").dataset.action, "check");
+  assert.equal(page.element("resume-card").hidden, true);
   assert.equal(page.element("check-status").hidden, false);
   assert.doesNotMatch(page.element("status").textContent, /No capture was sent/);
   await page.submitCard();
@@ -970,10 +977,11 @@ test("a failed recovery preserves the original capture error and cannot be overw
   assert.match(page.element("status").textContent, /Payment status could not be checked/);
   assert.doesNotMatch(page.element("status").textContent, /capture result is uncertain/);
   assert.doesNotMatch(page.element("activity").textContent, /private-sdk-token/);
-  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("card-submit").disabled, false);
+  assert.equal(page.element("card-submit").dataset.action, "check");
   assert.equal(page.element("check-status").hidden, false);
   assert.equal(page.cardConfigurations.length, 1);
-  await page.element("check-status").events.click();
+  await page.submitCard();
   assert.match(page.element("status").textContent, /Card payment completed/);
   assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
 });
@@ -1090,7 +1098,8 @@ test("a missing order with a possible capture keeps its payment guard while the 
   assert.equal(page.cardRenders.length, 4);
   assert.equal(page.element("card-form").hidden, false);
   assert.equal(page.element("alternative-controls").inert, false);
-  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("card-submit").disabled, false);
+  assert.equal(page.element("card-submit").dataset.action, "check");
   assert.equal(page.element("check-status").hidden, false);
   assert.equal(page.storage.get("editfi:new:card"), oldKey);
   assert.match(page.element("status").textContent, /previous checkout.*could not be checked/);
@@ -1107,7 +1116,8 @@ test("a saved capture marker keeps a missing order guarded when execution ended 
   await page.ready();
   await page.openCard();
   assert.equal(page.cardRenders.length, 4);
-  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("card-submit").disabled, false);
+  assert.equal(page.element("card-submit").dataset.action, "check");
   assert.equal(page.storage.get("editfi:new:card"), oldKey);
   assert.equal(page.requests.some((request) => request.path === "/api/orders"), false);
 });
@@ -1142,6 +1152,108 @@ test("an operation lookup failure can be checked again after the SDK loads", asy
   assert.equal(attempts, 2);
   assert.equal(page.element("card-submit").disabled, false);
   assert.equal(page.requests.some((request) => request.path === "/api/orders" || request.path.endsWith("/capture")), false);
+});
+
+for (const flow of ["new", "returning"]) {
+  test(`${flow} primary card button checks a previous unresolved payment and becomes Pay by card after an unpaid result`, async () => {
+    let checks = 0;
+    const key = crypto.randomUUID();
+    const page = browser(flow, (path) => {
+      if (path.startsWith("/api/operations/")) return { flow: "card", captureRequested: true, order: { id: complete.id } };
+      if (path === `/api/orders/${complete.id}`) {
+        if (++checks === 1) throw new Error("status response lost");
+        return { order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" }, captureRequested: false };
+      }
+    }, savedBuyer, true, { storage: [[`editfi:${flow}:card`, key]] });
+    await page.ready();
+    await page.openCard();
+    assert.equal(page.element("card-submit").disabled, false);
+    assert.equal(page.element("card-submit-label").textContent, "Check previous payment");
+    assert.equal(page.element("card-submit-amount").hidden, true);
+    assert.match(page.element("card-action-hint").textContent, new RegExp(complete.id));
+    await page.submitCard();
+    assert.equal(checks, 2);
+    assert.equal(page.element("card-submit").disabled, false);
+    assert.equal(page.element("card-submit-label").textContent, "Pay by card");
+    assert.equal(page.element("card-submit-amount").hidden, false);
+    assert.equal(page.element("card-action-hint").hidden, true);
+    assert.equal(page.cardSubmissions.length, 0);
+    assert.equal(page.requests.every((request) => request.init.method === "GET" || request.path === "/api/client-token"), true);
+    const entries = page.element("activity").textContent.split("\n\n").map((value) => JSON.parse(value));
+    assert.ok(entries.some((entry) => entry.event === "Card checkout state" && entry.data.action === "check" && entry.data.unresolved));
+    assert.ok(entries.some((entry) => entry.event === "Card checkout state" && entry.data.action === "pay" && entry.data.cardMounted));
+  });
+
+  test(`${flow} primary card button explicitly completes the existing approved order without submitting new card details`, async () => {
+    const key = crypto.randomUUID();
+    const page = browser(flow, (path) => {
+      if (path.startsWith("/api/operations/")) return { flow: "card", captureRequested: true, order: { id: complete.id } };
+      if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "APPROVED", cardAuthenticated: true }, captureRequested: true };
+    }, savedBuyer, true, { storage: [[`editfi:${flow}:card`, key]] });
+    await page.ready();
+    await page.openCard();
+    assert.equal(page.element("card-submit").disabled, false);
+    assert.equal(page.element("card-submit-label").textContent, "Complete approved card payment");
+    assert.match(page.element("card-action-hint").textContent, new RegExp(complete.id));
+    assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+    await page.submitCard();
+    assert.equal(page.cardSubmissions.length, 0);
+    assert.equal(page.requests.some((request) => request.path === "/api/orders"), false);
+    assert.equal(page.requests.filter((request) => request.path === `/api/orders/${complete.id}/capture`).length, 1);
+    assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+    assert.equal(page.storage.get(`editfi:${flow}:card`), key);
+  });
+}
+
+test("a primary status check without an order ID retries only the operation lookup", async () => {
+  let attempts = 0;
+  const page = browser("new", (path) => {
+    if (path.startsWith("/api/operations/")) {
+      if (++attempts === 1) throw new Error("operation lookup failed");
+      return { flow: "card", captureRequested: false, order: { id: complete.id } };
+    }
+    if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "CREATED" }, captureRequested: false };
+  }, savedBuyer, true, { storage: [["editfi:new:card", crypto.randomUUID()]] });
+  await page.ready();
+  await page.openCard();
+  assert.equal(page.element("card-submit-label").textContent, "Check previous payment");
+  await page.submitCard();
+  assert.equal(attempts, 2);
+  assert.equal(page.element("card-submit-label").textContent, "Pay by card");
+  assert.equal(page.requests.every((request) => request.init.method === "GET"), true);
+});
+
+test("the primary card status action never reissues a direct saved-PayPal charge", async () => {
+  const page = browser("returning", (path) => {
+    if (path === "/api/direct-charge") throw new Error("direct charge response lost");
+    if (path.startsWith("/api/operations/")) return { flow: "direct", order: complete };
+  });
+  await page.ready();
+  await page.element("place-order").events.click();
+  await page.openCard();
+  assert.equal(page.element("card-submit-label").textContent, "Check previous payment");
+  await page.submitCard();
+  assert.equal(page.requests.filter((request) => request.path === "/api/direct-charge").length, 1);
+  assert.equal(page.requests.some((request) => request.path === "/api/orders" || request.path.endsWith("/capture")), false);
+  assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+});
+
+test("a loading card button explains the wait and enables payment after all hosted fields finish rendering", async () => {
+  let release;
+  const cardRenderWait = new Promise((resolve) => { release = resolve; });
+  const page = browser("new", undefined, savedBuyer, true, { cardRenderWait });
+  await page.ready();
+  const opening = page.openCard();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(page.cardRenders.length, 4);
+  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("card-submit-label").textContent, "Loading card fields…");
+  assert.match(page.element("card-action-hint").textContent, /Waiting for secure card fields/);
+  release();
+  await opening;
+  assert.equal(page.element("card-submit").disabled, false);
+  assert.equal(page.element("card-submit-label").textContent, "Pay by card");
+  assert.equal(page.element("card-action-hint").hidden, true);
 });
 
 for (const kind of ["card", "direct"]) {
@@ -1247,7 +1359,8 @@ test("saved-card checkout follows 3DS and restores an authenticated order for ex
   assert.equal(input.vaultRevision, savedCardBuyer.revision);
   assert.equal(input.vault_id, undefined);
   assert.equal(first.requests.some((request) => request.path.endsWith("/capture")), false);
-  assert.equal(first.element("card-submit").disabled, true);
+  assert.equal(first.element("card-submit").disabled, false);
+  assert.equal(first.element("card-submit").dataset.action, "check");
   const returned = browser("returning", (path) => {
     if (path.startsWith("/api/operations/")) return { order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" }, flow: "saved-card" };
     if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "APPROVED", cardAuthenticated: true } };
