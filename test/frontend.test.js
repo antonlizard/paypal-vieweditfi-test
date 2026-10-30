@@ -18,6 +18,16 @@ const captureTrace = {
 };
 const savedCreateTrace = { ...createTrace, request: { ...createTrace.request, headers: { ...createTrace.request.headers, Authorization: "[REDACTED]" }, authentication: { method: "Bearer", token: "[REDACTED]" } } };
 
+function missingOrderResponse(orderID) {
+  return Response.json({ error: "PAYPAL_API_ERROR", message: "The specified resource does not exist.", details: {
+    httpStatus: 404, name: "RESOURCE_NOT_FOUND", debugId: "missing-order-debug", issues: [{ issue: "INVALID_RESOURCE_ID" }],
+    traces: { get: { attempted: true, request: {
+      method: "GET", url: `https://api-m.sandbox.paypal.com/v2/checkout/orders/${orderID}?fields=payment_source`,
+      headers: { Authorization: "[REDACTED]" }, authentication: { method: "Bearer", token: "[REDACTED]" }, body: null,
+    }, response: { status: 404, body: { name: "RESOURCE_NOT_FOUND", details: [{ issue: "INVALID_RESOURCE_ID" }] } } } },
+  } }, { status: 502 });
+}
+
 // This exercises browser event logic and SDK configuration with a fake DOM and
 // PayPal SDK. It is a contract test, not visual/browser or real-PayPal testing.
 function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, hasComponent = true, options = {}) {
@@ -98,13 +108,10 @@ function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, has
       throw new Error(`Unexpected API call: ${path}`);
     },
   });
-  vm.runInContext(source, context);
+  const startup = vm.runInContext(source, context);
   async function ready() {
-    for (let count = 0; count < 100; count++) {
-      if (cardCallbacks || renders.length || element("status").className.includes("error") || element("status").className.includes("success")) return;
-      await new Promise((resolve) => setImmediate(resolve));
-    }
-    assert.fail("Frontend did not finish initialization");
+    await startup;
+    await new Promise((resolve) => setImmediate(resolve));
   }
   async function selectMethod(method) {
     element(`method-${method}`).checked = true;
@@ -828,6 +835,139 @@ test("a confirmed decline during capture enables a fresh card submission without
   assert.equal(page.element("save-card").disabled, false);
   assert.equal(page.element("card-submit").disabled, false);
   assert.equal(page.storage.has("editfi:new:card"), false);
+});
+
+for (const flow of ["new", "returning"]) {
+  test(`${flow} checkout loads card fields and replaces an unavailable unpaid order during recovery`, async () => {
+    const oldKey = crypto.randomUUID();
+    const storageKey = `editfi:${flow}:card`;
+    let lookups = 0;
+    const page = browser(flow, (path) => {
+      if (path.startsWith("/api/operations/")) return { flow: "card", savePaymentMethod: false,
+        order: { id: "MISSING0001", status: "PAYER_ACTION_REQUIRED" }, traces: { create: savedCreateTrace } };
+      if (path === "/api/orders/MISSING0001") { lookups++; return missingOrderResponse("MISSING0001"); }
+    }, savedBuyer, true, { storage: [[storageKey, oldKey]], search: "?card=return" });
+    await page.ready();
+    await page.openCard();
+    assert.equal(page.scripts.length, 1);
+    assert.equal(page.cardRenders.length, 4);
+    assert.equal(page.element("card-submit").disabled, false);
+    assert.equal(page.element("card-form").hidden, false);
+    assert.equal(page.storage.has(storageKey), false);
+    assert.equal(lookups, 1);
+    assert.match(page.element("status").textContent, /previous unpaid checkout is no longer available/);
+    assert.match(page.element("activity").textContent, /Unavailable unpaid checkout cleared/);
+    assert.equal(page.element("get-trace-status").textContent, "HTTP 404");
+    assert.equal(page.requests.some((request) => request.path === "/api/orders" || request.path.endsWith("/capture")), false);
+    await page.submitCard();
+    const created = page.requests.find((request) => request.path === "/api/orders");
+    assert.notEqual(created.body.requestId, oldKey);
+    assert.match(page.element("status").textContent, /Card payment completed/);
+  });
+}
+
+test("a missing local unpaid order does not stop SDK initialization", async () => {
+  const oldKey = crypto.randomUUID();
+  const page = browser("new", (path) => {
+    if (path.startsWith("/api/operations/")) return { flow: "card", order: { id: "MISSING0001", status: "CREATED" } };
+    if (path === "/api/orders/MISSING0001") return Response.json({ error: "UNKNOWN_ORDER", message: "Unknown order" }, { status: 404 });
+  }, savedBuyer, true, { storage: [["editfi:new:card", oldKey]] });
+  await page.ready();
+  await page.openCard();
+  assert.equal(page.cardRenders.length, 4);
+  assert.equal(page.element("card-submit").disabled, false);
+  assert.equal(page.storage.has("editfi:new:card"), false);
+});
+
+test("a missing order with a possible capture keeps its payment guard while the SDK and fields load", async () => {
+  const oldKey = crypto.randomUUID();
+  const page = browser("new", (path) => {
+    if (path.startsWith("/api/operations/")) return { flow: "card", order: { id: "MISSING0001", status: "APPROVED" },
+      traces: { capture: { request: captureTrace.request, attempted: true, response: null } } };
+    if (path === "/api/orders/MISSING0001") return missingOrderResponse("MISSING0001");
+  }, savedBuyer, true, { storage: [["editfi:new:card", oldKey]] });
+  await page.ready();
+  await page.openCard();
+  assert.equal(page.cardRenders.length, 4);
+  assert.equal(page.element("card-form").hidden, false);
+  assert.equal(page.element("alternative-controls").inert, false);
+  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("check-status").hidden, false);
+  assert.equal(page.storage.get("editfi:new:card"), oldKey);
+  assert.match(page.element("status").textContent, /previous checkout.*could not be checked/);
+  assert.equal(page.requests.some((request) => request.path === "/api/orders" || request.path.endsWith("/capture")), false);
+});
+
+test("a saved capture marker keeps a missing order guarded when execution ended before its trace was saved", async () => {
+  const oldKey = crypto.randomUUID();
+  const page = browser("new", (path) => {
+    if (path.startsWith("/api/operations/")) return { flow: "card", captureRequested: true,
+      order: { id: "MISSING0001", status: "APPROVED" }, traces: { create: savedCreateTrace } };
+    if (path === "/api/orders/MISSING0001") return missingOrderResponse("MISSING0001");
+  }, savedBuyer, true, { storage: [["editfi:new:card", oldKey]] });
+  await page.ready();
+  await page.openCard();
+  assert.equal(page.cardRenders.length, 4);
+  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.storage.get("editfi:new:card"), oldKey);
+  assert.equal(page.requests.some((request) => request.path === "/api/orders"), false);
+});
+
+test("a transient recovery failure still initializes the SDK and preserves the existing operation", async () => {
+  const oldKey = crypto.randomUUID();
+  const page = browser("new", (path) => {
+    if (path.startsWith("/api/operations/")) return { flow: "card", order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" } };
+    if (path === `/api/orders/${complete.id}`) return Response.json({ error: "PAYPAL_UNREACHABLE", message: "PayPal unavailable" }, { status: 502 });
+  }, savedBuyer, true, { storage: [["editfi:new:card", oldKey]] });
+  await page.ready();
+  await page.openCard();
+  assert.equal(page.cardRenders.length, 4);
+  assert.equal(page.element("card-form").hidden, false);
+  assert.equal(page.storage.get("editfi:new:card"), oldKey);
+  assert.equal(page.element("check-status").hidden, false);
+});
+
+test("an operation lookup failure can be checked again after the SDK loads", async () => {
+  let attempts = 0;
+  const page = browser("new", (path) => {
+    if (path.startsWith("/api/operations/")) {
+      if (++attempts === 1) throw new Error("connection lost");
+      return { flow: "card", order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" } };
+    }
+    if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" } };
+  }, savedBuyer, true, { storage: [["editfi:new:card", crypto.randomUUID()]] });
+  await page.ready();
+  await page.openCard();
+  assert.equal(page.cardRenders.length, 4);
+  await page.element("check-status").events.click();
+  assert.equal(attempts, 2);
+  assert.equal(page.element("card-submit").disabled, false);
+  assert.equal(page.requests.some((request) => request.path === "/api/orders" || request.path.endsWith("/capture")), false);
+});
+
+for (const kind of ["card", "direct"]) {
+  test(`a completed ${kind} checkout is restored from durable history without requesting a missing PayPal order`, async () => {
+    const flow = kind === "card" ? "new" : "returning";
+    const key = kind === "card" ? "editfi:new:card" : "editfi:returning:revision-1:direct";
+    const page = browser(flow, (path) => {
+      if (path.startsWith("/api/operations/")) return { flow: kind, order: complete, traces: { capture: captureTrace } };
+      if (path === `/api/orders/${complete.id}`) return missingOrderResponse(complete.id);
+    }, savedBuyer, true, { storage: [[key, crypto.randomUUID()]] });
+    await page.ready();
+    assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+    assert.match(page.element("status").textContent, /completed/);
+    assert.equal(page.requests.some((request) => request.path.startsWith("/api/orders") || request.path === "/api/direct-charge"), false);
+  });
+}
+
+test("a completed capture trace recovers a payment even when its summary was not saved", async () => {
+  const page = browser("new", (path) => {
+    if (path.startsWith("/api/operations/")) return { flow: "card", order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" }, traces: { capture: captureTrace } };
+  }, savedBuyer, true, { storage: [["editfi:new:card", crypto.randomUUID()]] });
+  await page.ready();
+  assert.match(page.element("status").textContent, /Card payment completed/);
+  assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+  assert.equal(page.requests.some((request) => request.path.startsWith("/api/orders")), false);
 });
 
 test("reload and card redirects restore approved card orders without an automatic capture", async () => {

@@ -111,7 +111,8 @@ export class VaultStore {
     const operationMatch = path.match(/^\/api\/operations\/([0-9a-f-]+)$/i);
     if (method === "GET" && operationMatch && UUID.test(operationMatch[1])) {
       const operation = await this.storage.get(`operation:${operationMatch[1]}`);
-      return json({ order: operation?.result || null, flow: operation?.flow, savePaymentMethod: operation?.savePaymentMethod ?? operation?.flow === "new", traces: operation?.traces || {} });
+      return json({ order: operation?.result || null, flow: operation?.flow, captureRequested: operation?.captureRequested === true,
+        savePaymentMethod: operation?.savePaymentMethod ?? operation?.flow === "new", traces: operation?.traces || {} });
     }
     const orderMatch = path.match(/^\/api\/orders\/([A-Z0-9]+)(\/capture)?$/i);
     if (orderMatch && ORDER_ID.test(orderMatch[1])) {
@@ -275,6 +276,12 @@ export class VaultStore {
   async paymentRequest(operation, kind, path, init) {
     const trace = {};
     operation.traces ||= {};
+    if (kind === "capture") {
+      // Preserve a possible payment even if execution ends before a response
+      // trace can be saved. Recovery must never mistake it for an unpaid order.
+      operation.captureRequested = true;
+      await this.storage.put(`operation:${operation.requestId}`, operation);
+    }
     try {
       const result = await this.paypal.api(path, { ...init, trace });
       // Retain request/response history without retaining usable credentials.

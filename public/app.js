@@ -8,6 +8,7 @@ let cardStage = "idle", cardCancelled = false;
 let cardSession, cardFieldElements = [], cardInterrupted = false;
 let cardCaptureAttempted = false;
 let cardNeedsNewOrder = false;
+let recoveryNotice, recoveryAttempted = false;
 const activity = [];
 const backendErrors = new WeakSet();
 const context = () => flow === "new" ? "new" : `returning:${buyer?.revision}`;
@@ -123,7 +124,7 @@ async function api(path, body) {
   if (result.details?.traces) showApiTraces(result.details.traces);
   if (!response.ok) {
     const error = new Error(result.message || `Request failed (${response.status}).`);
-    Object.assign(error, { code: result.error, details: result.details });
+    Object.assign(error, { code: result.error, details: result.details, httpStatus: response.status });
     backendErrors.add(error);
     throw error;
   }
@@ -318,31 +319,101 @@ function loadSDK(clientToken) {
   });
 }
 
+function completedCheckoutHistory(previous) {
+  if (previous.order?.completed === true) return previous.order;
+  for (const kind of ["capture", "create"]) {
+    const response = previous.traces?.[kind]?.response;
+    const order = response?.body;
+    if (response?.status >= 200 && response.status < 300 && order?.id && order.status === "COMPLETED" &&
+        (!previous.order?.id || order.id === previous.order.id) &&
+        order.purchase_units?.some((unit) => unit.payments?.captures?.some((capture) => capture.status === "COMPLETED"))) {
+      return { ...order, completed: true };
+    }
+  }
+  return null;
+}
+
+function missingRecoveryOrder(error) {
+  if (error.code === "UNKNOWN_ORDER" && error.httpStatus === 404) return true;
+  const lookup = error.details?.traces?.get;
+  return error.code === "PAYPAL_API_ERROR" && error.details?.httpStatus === 404 &&
+    lookup?.request?.method === "GET" && lookup.response?.status === 404 &&
+    (error.details.name === "RESOURCE_NOT_FOUND" || error.details.issues?.some((issue) =>
+      ["INVALID_RESOURCE_ID", "RESOURCE_NOT_FOUND"].includes(issue.issue)));
+}
+
+function recoveryMayHavePayment(kind, previous) {
+  if (kind === "direct" || previous?.flow === "direct") return true;
+  if (completedCheckoutHistory(previous || {})) return true;
+  if (previous?.order && failedCardPayment(previous.order, previous.traces)) return false;
+  return previous?.captureRequested === true || previous?.order?.status === "COMPLETED" || hasCapture(previous?.order || {}) ||
+    previous?.traces?.capture?.attempted === true;
+}
+
 async function recoverAttempt() {
+  recoveryAttempted = true;
   for (const kind of ["saved-card", "card", "direct", "component"]) {
     const key = sessionStorage.getItem(storageKey(kind));
     if (!key) continue;
-    const previous = await api(`/api/operations/${encodeURIComponent(key)}`);
-    if (kind === "component" && flow === "new" && typeof previous.savePaymentMethod === "boolean") {
-      savePayPalChoice = $("save-paypal").checked = previous.savePaymentMethod;
-    }
-    if (kind === "card" && flow === "new" && typeof previous.savePaymentMethod === "boolean") {
-      saveCardChoice = $("save-card").checked = previous.savePaymentMethod;
-    }
-    if (!previous.order?.id) continue;
-    if (flow === "new") await selectPaymentMethod(kind === "card" ? "card" : "paypal");
-    const result = await api(`/api/orders/${encodeURIComponent(previous.order.id)}`);
-    if (["card", "saved-card"].includes(kind)) {
-      await restoreCard(result, kind);
+    let previous;
+    try {
+      previous = await api(`/api/operations/${encodeURIComponent(key)}`);
+      if (kind === "component" && flow === "new" && typeof previous.savePaymentMethod === "boolean") {
+        savePayPalChoice = $("save-paypal").checked = previous.savePaymentMethod;
+      }
+      if (kind === "card" && flow === "new" && typeof previous.savePaymentMethod === "boolean") {
+        saveCardChoice = $("save-card").checked = previous.savePaymentMethod;
+      }
+      const completed = completedCheckoutHistory(previous);
+      if (completed) {
+        activeMethod = ["card", "saved-card"].includes(kind) ? kind : "paypal";
+        await finish({ order: completed, traces: previous.traces || {} });
+        return true;
+      }
+      if (!previous.order?.id) continue;
+      if (["card", "saved-card"].includes(kind)) cardCaptureAttempted ||= previous.captureRequested === true;
+      if (flow === "new") await selectPaymentMethod(kind === "card" ? "card" : "paypal");
+      const result = await api(`/api/orders/${encodeURIComponent(previous.order.id)}`);
+      if (["card", "saved-card"].includes(kind)) {
+        await restoreCard(result, kind);
+        return true;
+      }
+      if (result.order.completed || kind === "direct" || hasCapture(result.order)) {
+        await finish(result);
+        return true;
+      }
+      if (savedPayPal() && result.order.status === "APPROVED") {
+        awaitPlacement(result.order);
+        return false;
+      }
+    } catch (error) {
+      const orderID = previous?.order?.id;
+      if (previous && missingRecoveryOrder(error) && !recoveryMayHavePayment(kind, previous)) {
+        sessionStorage.removeItem(storageKey(kind));
+        if (!lastOrderId || lastOrderId === orderID) {
+          if (cardSession?.orderID === orderID) resetInterruptedCard(cardSession, false);
+          lastOrderId = cardOrderId = approvedOrderId = approvedCardOrderId = savedCardAuthenticationUrl = undefined;
+          unresolved = cardInterrupted = cardCaptureAttempted = false;
+          busy = false;
+          showPaymentDetails(null);
+        }
+        recoveryNotice = { message: "The previous unpaid checkout is no longer available. You can start a new purchase.", type: "" };
+        log("Unavailable unpaid checkout cleared", { kind, orderID, code: error.code,
+          httpStatus: error.details?.httpStatus || error.httpStatus, debugId: error.details?.debugId });
+        continue;
+      }
+      // Recovery failures must not stop SDK initialization. Keep possible
+      // charges guarded, but still render the payment methods and card fields.
+      activeMethod = ["card", "saved-card"].includes(kind) ? kind : "paypal";
+      lastOrderId = orderID;
+      if (activeMethod.includes("card")) cardOrderId = orderID;
+      unresolved = !paid;
+      cardInterrupted = activeMethod.includes("card");
+      busy = submittingPayment = cardSubmitting = false;
+      showPaymentDetails(previous?.order);
+      showError(error);
+      recoveryNotice = { message: `The previous checkout${orderID ? ` (${orderID})` : ""} could not be checked. Payment methods are loaded; check payment status before submitting another payment.`, type: "error" };
       return true;
-    }
-    if (result.order.completed || kind === "direct" || hasCapture(result.order)) {
-      await finish(result);
-      return true;
-    }
-    if (savedPayPal() && result.order.status === "APPROVED") {
-      awaitPlacement(result.order);
-      return false;
     }
   }
   return false;
@@ -392,7 +463,7 @@ async function start() {
     }
     status(buyer ? "Waiting for a vaulted token from PayPal." : "Create a saved buyer in Flow 01 to continue.");
   }
-  if (!approvedOrderId && !cardOrderId) await recoverAttempt();
+  if (!recoveryAttempted && !approvedOrderId && !cardOrderId) await recoverAttempt();
   if (paid) return;
   let token;
   if (savedPayPal()) {
@@ -435,7 +506,8 @@ async function start() {
   }
   mounted = flow === "new" || Boolean(token) || (savedCard() && buyer.state === "VAULTED");
   controls();
-  if (!unresolved && !cardOrderId) status(approvedOrderId ? placeOrderPrompt : flow === "new" ? "Ready. Select a payment method to continue." : mounted ? "Ready. Review or edit the saved method, or choose a card payment." : "No saved PayPal method is ready. You can pay by card below.");
+  if (recoveryNotice) status(recoveryNotice.message, recoveryNotice.type);
+  else if (!unresolved && !cardOrderId) status(approvedOrderId ? placeOrderPrompt : flow === "new" ? "Ready. Select a payment method to continue." : mounted ? "Ready. Review or edit the saved method, or choose a card payment." : "No saved PayPal method is ready. You can pay by card below.");
   if (mounted) log(flow === "new" ? "Payment method choices ready" : "SavedPaymentMethods rendered");
 }
 
@@ -847,10 +919,12 @@ $("check-status").addEventListener("click", async () => {
         await finish(result);
       }
     } else {
-      if (activeMethod === "saved-card") {
+      if (activeMethod.includes("card")) {
+        recoveryNotice = undefined;
         await recoverAttempt();
         busy = false;
         controls();
+        if (recoveryNotice) status(recoveryNotice.message, recoveryNotice.type);
         return;
       }
       // Recover a direct-charge response lost before the order ID arrived.

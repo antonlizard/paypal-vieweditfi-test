@@ -76,6 +76,8 @@ function harness() {
     }
     const match = path.match(/^\/v2\/checkout\/orders\/(ORDER\d+)(\/(?:capture|confirm-payment-source))?$/);
     assert.ok(match, `Unexpected PayPal request ${path}`);
+    if (mock.missingOrderId === match[1]) return Response.json({ name: "RESOURCE_NOT_FOUND", message: "The specified resource does not exist.",
+      debug_id: "missing-order-debug", details: [{ issue: "INVALID_RESOURCE_ID", description: "Unknown order" }] }, { status: 404 });
     const order = orders.get(match[1]);
     assert.ok(order);
     if (match[2] === "/confirm-payment-source") {
@@ -87,6 +89,7 @@ function harness() {
       return Response.json(order.result, { status: 200 });
     }
     if (match[2] === "/capture") {
+      if (mock.beforeCapture) await mock.beforeCapture();
       if (mock.failCapture) return Response.json({ name: "UNPROCESSABLE_ENTITY", message: "Payment declined", debug_id: "safe-debug-id" }, { status: 422 });
       order.result = completed(order, order.id);
     }
@@ -309,6 +312,41 @@ test("Get Order details retain a redacted request and authentication result with
   const restored = await h.call(`/api/operations/${requestId}`);
   assert.deepEqual(restored.body.traces.get, result.body.traces.get);
   assert.equal(JSON.stringify(result.body).includes("server-access-token"), false);
+});
+
+test("a missing PayPal order preserves its 404 details and trace for safe checkout recovery", async () => {
+  const h = harness();
+  const requestId = crypto.randomUUID();
+  const created = await h.call("/api/orders", { flow: "card", page: "new", requestId });
+  h.mock.missingOrderId = created.body.order.id;
+  const result = await h.call(`/api/orders/${created.body.order.id}`);
+  assert.equal(result.status, 502);
+  assert.equal(result.body.details.httpStatus, 404);
+  assert.equal(result.body.details.name, "RESOURCE_NOT_FOUND");
+  assert.equal(result.body.details.issues[0].issue, "INVALID_RESOURCE_ID");
+  assert.equal(result.body.details.traces.get.request.method, "GET");
+  assert.equal(result.body.details.traces.get.response.status, 404);
+  assert.equal(result.body.details.traces.capture, undefined);
+  assert.equal(JSON.stringify(result.body).includes("server-access-token"), false);
+  h.restart();
+  const recovered = await h.call(`/api/operations/${requestId}`);
+  assert.equal(recovered.body.traces.get.response.status, 404);
+  assert.equal(h.calls.some((call) => call.path.endsWith("/capture")), false);
+});
+
+test("capture intent is stored before dispatch so restart recovery does not depend on a response trace", async () => {
+  const h = harness();
+  const requestId = crypto.randomUUID();
+  const created = await h.call("/api/orders", { flow: "card", page: "new", requestId });
+  h.mock.beforeCapture = async () => {
+    const operation = await h.storage.get(`operation:${requestId}`);
+    assert.equal(operation.captureRequested, true);
+    assert.equal(operation.traces.capture, undefined);
+  };
+  await h.call(`/api/orders/${created.body.order.id}/capture`, {});
+  h.restart();
+  const recovered = await h.call(`/api/operations/${requestId}`);
+  assert.equal(recovered.body.captureRequested, true);
 });
 
 test("saved-card confirmation retries reuse the same order and idempotency key after a lost response", async () => {
