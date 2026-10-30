@@ -31,7 +31,7 @@ function missingOrderResponse(orderID) {
 // This exercises browser event logic and SDK configuration with a fake DOM and
 // PayPal SDK. It is a contract test, not visual/browser or real-PayPal testing.
 function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, hasComponent = true, options = {}) {
-  const elements = new Map(), scripts = [], renders = [], cardRenders = [], cardSubmissions = [], cardConfigurations = [], closedFields = [], requests = [], navigations = [], storage = new Map(options.storage);
+  const elements = new Map(), scripts = [], renders = [], cardRenders = [], cardSubmissions = [], cardConfigurations = [], closedFields = [], requests = [], navigations = [], consoleLogs = [], storage = new Map(options.storage);
   let callbacks, cardCallbacks;
   function element(id) {
     if (!elements.has(id)) elements.set(id, {
@@ -107,6 +107,7 @@ function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, has
     history: { replaceState() {} },
     sessionStorage: { getItem: (key) => storage.get(key) || null, setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) },
     crypto, URLSearchParams, Intl, Date,
+    console: { info: (...values) => consoleLogs.push(values), error: (...values) => consoleLogs.push(values) },
     fetch: async (path, init) => {
       const body = init.body ? JSON.parse(init.body) : undefined;
       requests.push({ path, body, init });
@@ -146,7 +147,7 @@ function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, has
     await element("card-form").events.submit({ preventDefault() {} });
     await new Promise((resolve) => setImmediate(resolve));
   }
-  return { ready, selectMethod, openCard, submitCard, element, scripts, renders, cardRenders, cardSubmissions, cardConfigurations, closedFields, requests, navigations, storage, get callbacks() { return callbacks; }, get cardCallbacks() { return cardCallbacks; } };
+  return { ready, selectMethod, openCard, submitCard, element, scripts, renders, cardRenders, cardSubmissions, cardConfigurations, closedFields, requests, navigations, consoleLogs, storage, get callbacks() { return callbacks; }, get cardCallbacks() { return cardCallbacks; } };
 }
 
 test("new page loads SDK v5 with vaulting, PayPal Buttons and Card Fields", async () => {
@@ -279,29 +280,22 @@ test("returning approval waits for Place order, which captures the approved orde
   assert.equal(page.requests.filter((request) => request.path === "/api/direct-charge").length, 0);
 });
 
-test("a lost direct-charge response blocks editing and recovers using the original request ID", async () => {
-  let attempts = 0;
+test("a lost direct-charge response without an order ID cannot be retried by the diagnostic button", async () => {
   const page = browser("returning", (path) => {
-    if (path === "/api/direct-charge") {
-      if (++attempts === 1) throw new Error("connection lost");
-      return { order: complete };
-    }
+    if (path === "/api/direct-charge") throw new Error("connection lost");
   });
   await page.ready();
   await page.element("place-order").events.click();
   assert.equal(page.element("place-order").disabled, true);
-  assert.equal(page.element("check-status").hidden, false);
+  assert.equal(page.element("check-last-order").disabled, true);
   await assert.rejects(page.callbacks.createOrder(), /already submitted/);
-  await page.element("check-status").events.click();
-  const calls = page.requests.filter((request) => request.path === "/api/direct-charge");
-  assert.equal(calls.length, 2);
-  assert.equal(calls[0].body.requestId, calls[1].body.requestId);
-  assert.match(page.element("status").textContent, /Payment completed/);
-  assert.equal(page.element("payment-order-id").textContent, complete.id);
-  assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+  const before = page.requests.length;
+  await page.element("check-last-order").events.click();
+  assert.equal(page.requests.length, before);
+  assert.equal(page.requests.filter((request) => request.path === "/api/direct-charge").length, 1);
 });
 
-test("a pending capture shows its order ID and reveals the transaction ID only after completion", async () => {
+test("a pending capture logs a completed diagnostic response without replacing its receipt", async () => {
   const page = browser("returning", (path) => {
     if (path.endsWith("/capture")) return { order: {
       id: complete.id, status: "COMPLETED", completed: false,
@@ -316,9 +310,10 @@ test("a pending capture shows its order ID and reveals the transaction ID only a
   assert.equal(page.element("payment-order-id").textContent, complete.id);
   assert.equal(page.element("payment-capture-details").hidden, true);
   assert.equal(page.element("payment-capture-id").textContent, "—");
-  await page.element("check-status").events.click();
-  assert.equal(page.element("payment-capture-details").hidden, false);
-  assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+  await page.element("check-last-order").events.click();
+  assert.equal(page.element("payment-capture-details").hidden, true);
+  assert.equal(page.element("payment-capture-id").textContent, "—");
+  assert.match(page.element("activity").textContent, /CAPTURE00001/);
 });
 
 test("Place order without editing makes only a direct saved-method payment", async () => {
@@ -416,7 +411,7 @@ test("returning redirect approval waits for Place order on the merchant page", a
 });
 
 for (const settled of [false, true]) {
-  test(`lost capture response recovers ${settled ? "a completed payment" : "an uncharged approved order"} without charging during status checks`, async () => {
+  test(`lost capture response logs ${settled ? "a completed payment" : "an uncharged approved order"} without charging during status checks`, async () => {
     let captures = 0;
     const page = browser("returning", (path) => {
       if (path.endsWith("/capture")) {
@@ -431,13 +426,14 @@ for (const settled of [false, true]) {
     await page.element("place-order").events.click();
     assert.equal(page.element("place-order").disabled, true);
     await page.callbacks.onApprove({ orderID: complete.id });
-    await page.element("check-status").events.click();
+    await page.element("check-last-order").events.click();
     assert.equal(captures, 1);
     assert.equal(page.requests.some((request) => request.path === "/api/direct-charge"), false);
-    assert.equal(page.element("place-order").disabled, settled);
-    if (!settled) await page.element("place-order").events.click();
-    assert.equal(captures, settled ? 1 : 2);
-    assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+    assert.equal(page.element("place-order").disabled, true);
+    await page.element("place-order").events.click();
+    assert.equal(captures, 1);
+    assert.equal(page.element("payment-capture-id").textContent, "—");
+    assert.match(page.element("activity").textContent, /Get last order details response/);
   });
 }
 
@@ -541,10 +537,10 @@ test("a lost card capture response checks status without charging again and allo
   await page.ready();
   await page.openCard();
   await page.submitCard();
-  assert.equal(page.element("check-status").hidden, false);
-  assert.equal(page.element("card-submit").disabled, false);
-  assert.equal(page.element("card-submit").dataset.action, "capture");
-  await page.element("check-status").events.click();
+  assert.equal(page.element("check-last-order").hidden, false);
+  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("card-submit").dataset.action, "blocked");
+  await page.element("check-last-order").events.click();
   assert.equal(captures, 1);
   assert.equal(page.element("resume-card").hidden, false);
   await page.element("resume-card").events.click();
@@ -563,9 +559,9 @@ test("a pending card capture cannot be submitted again using the approval recove
   await page.openCard();
   await page.submitCard();
   assert.equal(page.element("resume-card").hidden, true);
-  assert.equal(page.element("card-submit").disabled, false);
-  assert.equal(page.element("card-submit").dataset.action, "check");
-  assert.equal(page.element("check-status").hidden, false);
+  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("card-submit").dataset.action, "blocked");
+  assert.equal(page.element("check-last-order").hidden, false);
   await page.element("resume-card").events.click();
   await page.submitCard(); // The primary action checks status, not a new payment.
   assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
@@ -580,7 +576,7 @@ test("a failed card confirmation is recovered using the same order creation key"
   await page.submitCard();
   assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
   assert.equal(page.element("activity").textContent.includes("private SDK details"), false);
-  await page.element("check-status").events.click();
+  await page.element("check-last-order").events.click();
   assert.equal(page.element("card-submit").disabled, false);
   await page.submitCard();
   const creates = page.requests.filter((request) => request.path === "/api/orders");
@@ -615,7 +611,7 @@ for (const scenario of [
     }
     for (const value of ["4111111111111111", "private-sdk-token", "private SDK details", "example.test"]) assert.equal(activity.includes(value), false);
     assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
-    assert.equal(page.element("check-status").hidden, false);
+    assert.equal(page.element("check-last-order").hidden, false);
   });
 }
 
@@ -636,11 +632,11 @@ test("3DS cancellation blocks a late approval and status recovery logs PayPal's 
   assert.equal(page.element("activity").textContent.includes("private SDK details"), false);
   assert.equal(page.element("activity").textContent.includes("CARD_SDK_ERROR"), false);
   assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
-  await page.element("check-status").events.click();
-  assert.match(page.element("activity").textContent, /Card authentication status from PayPal/);
-  assert.match(page.element("activity").textContent, /"authenticationStatus": "Y"/);
-  assert.match(page.element("activity").textContent, /"liabilityShift": "POSSIBLE"/);
-  assert.equal(page.element("resume-card").hidden, false);
+  await page.element("check-last-order").events.click();
+  assert.match(page.element("activity").textContent, /Get last order details response/);
+  assert.match(page.element("activity").textContent, /"authentication_status": "Y"/);
+  assert.match(page.element("activity").textContent, /"liability_shift": "POSSIBLE"/);
+  assert.equal(page.element("resume-card").hidden, true);
   assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
 });
 
@@ -657,7 +653,7 @@ for (const flow of ["new", "returning"]) {
       await page.submitCard();
       assert.equal(page.element("alternative-controls").inert, false);
       assert.equal(page.element("card-submit").disabled, false);
-      assert.equal(page.element("check-status").hidden, false);
+      assert.equal(page.element("check-last-order").hidden, false);
       assert.equal(page.cardConfigurations.length, 2);
       assert.equal(page.closedFields.length, 4);
       for (const field of ["name", "number", "expiry", "cvv"]) assert.equal(page.element(`card-${field}-field`).replaced, true);
@@ -739,25 +735,25 @@ test("an uncertain capture allows method selection and card editing while guardi
   await page.submitCard();
   assert.equal(page.element("payment-methods").disabled, false);
   assert.equal(page.element("alternative-controls").inert, false);
-  assert.equal(page.element("card-submit").disabled, false);
-  assert.equal(page.element("card-submit").dataset.action, "capture");
+  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("card-submit").dataset.action, "blocked");
   await page.selectMethod("paypal");
   assert.equal(page.element("checkout-controls").hidden, false);
   assert.equal(page.element("checkout-controls").inert, true);
   await assert.rejects(page.callbacks.createOrder(), /already submitted/);
-  await page.element("check-status").events.click();
+  await page.element("check-last-order").events.click();
   assert.equal(captures, 1);
   await page.element("resume-card").events.click();
   assert.equal(captures, 2);
   assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
 });
 
-test("an approved uncaptured card restored after reload can be abandoned for PayPal", async () => {
+test("an approved uncaptured card restored on a card redirect can be abandoned for PayPal", async () => {
   const requestId = crypto.randomUUID();
   const page = browser("new", (path) => {
     if (path.startsWith("/api/operations/")) return { flow: "card", order: { id: complete.id } };
     if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "APPROVED", cardAuthenticated: true } };
-  }, savedBuyer, true, { storage: [["editfi:new:card", requestId]] });
+  }, savedBuyer, true, { search: "?card=return", storage: [["editfi:new:card", requestId]] });
   await page.ready();
   assert.equal(page.element("payment-methods").disabled, false);
   assert.equal(page.element("alternative-controls").inert, false);
@@ -773,7 +769,7 @@ test("a restored voided order enables save consent and starts a fresh card order
   const page = browser("new", (path) => {
     if (path.startsWith("/api/operations/")) return { flow: "card", savePaymentMethod: true, order: { id: "VOIDED00001" } };
     if (path === "/api/orders/VOIDED00001") return { order: { id: "VOIDED00001", status: "VOIDED" } };
-  }, savedBuyer, true, { storage: [["editfi:new:card", oldKey]] });
+  }, savedBuyer, true, { search: "?card=return", storage: [["editfi:new:card", oldKey]] });
   await page.ready();
   await page.openCard();
   assert.equal(page.element("save-card").disabled, false);
@@ -800,7 +796,7 @@ for (const outcome of ["declined-capture", "INSTRUMENT_DECLINED", "TRANSACTION_R
     const page = browser("new", (path) => {
       if (path.startsWith("/api/operations/")) return { flow: "card", savePaymentMethod: false, order: { id: order.id }, traces };
       if (path === `/api/orders/${order.id}`) return { order, traces };
-    }, savedBuyer, true, { storage: [["editfi:new:card", oldKey]] });
+    }, savedBuyer, true, { search: "?card=return", storage: [["editfi:new:card", oldKey]] });
     await page.ready();
     await page.openCard();
     assert.equal(page.element("save-card").disabled, false);
@@ -832,12 +828,12 @@ test("an already-captured API issue cannot be treated as a declined payment", as
     if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "APPROVED" }, traces: {
       capture: { ...captureTrace, response: { status: 422, body: { details: [{ issue: "ORDER_ALREADY_CAPTURED" }] } } },
     } };
-  }, savedBuyer, true, { storage: [["editfi:new:card", crypto.randomUUID()]] });
+  }, savedBuyer, true, { search: "?card=return", storage: [["editfi:new:card", crypto.randomUUID()]] });
   await page.ready();
   await page.openCard();
   assert.equal(page.element("save-card").disabled, false);
-  assert.equal(page.element("card-submit").disabled, false);
-  assert.equal(page.element("card-submit").dataset.action, "check");
+  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("card-submit").dataset.action, "blocked");
   await page.submitCard();
   assert.equal(page.requests.some((request) => request.path === "/api/orders"), false);
 });
@@ -899,7 +895,7 @@ test("a lost capture response automatically restores its completed transaction w
   await page.submitCard();
   assert.match(page.element("status").textContent, /Card payment completed/);
   assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
-  assert.equal(page.element("check-status").hidden, true);
+  assert.equal(page.element("check-last-order").disabled, false);
   assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
   assert.equal(page.requests.filter((request) => request.path === `/api/orders/${complete.id}`).length, 1);
   assert.equal(page.cardConfigurations.length, 1);
@@ -949,10 +945,10 @@ test("an older capture response keeps its payment guard even without an attempte
   await page.ready();
   await page.openCard();
   await page.submitCard();
-  assert.equal(page.element("card-submit").disabled, false);
-  assert.equal(page.element("card-submit").dataset.action, "check");
+  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("card-submit").dataset.action, "blocked");
   assert.equal(page.element("resume-card").hidden, true);
-  assert.equal(page.element("check-status").hidden, false);
+  assert.equal(page.element("check-last-order").hidden, false);
   assert.doesNotMatch(page.element("status").textContent, /No capture was sent/);
   await page.submitCard();
   assert.equal(page.requests.filter((request) => request.path === "/api/orders").length, 1);
@@ -977,12 +973,13 @@ test("a failed recovery preserves the original capture error and cannot be overw
   assert.match(page.element("status").textContent, /Payment status could not be checked/);
   assert.doesNotMatch(page.element("status").textContent, /capture result is uncertain/);
   assert.doesNotMatch(page.element("activity").textContent, /private-sdk-token/);
-  assert.equal(page.element("card-submit").disabled, false);
-  assert.equal(page.element("card-submit").dataset.action, "check");
-  assert.equal(page.element("check-status").hidden, false);
+  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("card-submit").dataset.action, "blocked");
+  assert.equal(page.element("check-last-order").hidden, false);
   assert.equal(page.cardConfigurations.length, 1);
-  await page.submitCard();
-  assert.match(page.element("status").textContent, /Card payment completed/);
+  await page.element("check-last-order").events.click();
+  assert.match(page.element("status").textContent, /The capture request timed out/);
+  assert.match(page.element("activity").textContent, /CAPTURE00001/);
   assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
 });
 
@@ -1039,7 +1036,7 @@ test("a completed capture stays successful when refreshing the saved method fail
   await page.submitCard();
   assert.match(page.element("status").textContent, /Card payment completed/);
   assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
-  assert.equal(page.element("check-status").hidden, true);
+  assert.equal(page.element("check-last-order").disabled, false);
   assert.match(page.element("activity").textContent, /Saved method refresh failed/);
   assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
 });
@@ -1078,7 +1075,7 @@ test("a missing local unpaid order does not stop SDK initialization", async () =
   const page = browser("new", (path) => {
     if (path.startsWith("/api/operations/")) return { flow: "card", order: { id: "MISSING0001", status: "CREATED" } };
     if (path === "/api/orders/MISSING0001") return Response.json({ error: "UNKNOWN_ORDER", message: "Unknown order" }, { status: 404 });
-  }, savedBuyer, true, { storage: [["editfi:new:card", oldKey]] });
+  }, savedBuyer, true, { search: "?card=return", storage: [["editfi:new:card", oldKey]] });
   await page.ready();
   await page.openCard();
   assert.equal(page.cardRenders.length, 4);
@@ -1092,15 +1089,15 @@ test("a missing order with a possible capture keeps its payment guard while the 
     if (path.startsWith("/api/operations/")) return { flow: "card", order: { id: "MISSING0001", status: "APPROVED" },
       traces: { capture: { request: captureTrace.request, attempted: true, response: null } } };
     if (path === "/api/orders/MISSING0001") return missingOrderResponse("MISSING0001");
-  }, savedBuyer, true, { storage: [["editfi:new:card", oldKey]] });
+  }, savedBuyer, true, { search: "?card=return", storage: [["editfi:new:card", oldKey]] });
   await page.ready();
   await page.openCard();
   assert.equal(page.cardRenders.length, 4);
   assert.equal(page.element("card-form").hidden, false);
   assert.equal(page.element("alternative-controls").inert, false);
-  assert.equal(page.element("card-submit").disabled, false);
-  assert.equal(page.element("card-submit").dataset.action, "check");
-  assert.equal(page.element("check-status").hidden, false);
+  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("card-submit").dataset.action, "blocked");
+  assert.equal(page.element("check-last-order").hidden, false);
   assert.equal(page.storage.get("editfi:new:card"), oldKey);
   assert.match(page.element("status").textContent, /previous checkout.*could not be checked/);
   assert.equal(page.requests.some((request) => request.path === "/api/orders" || request.path.endsWith("/capture")), false);
@@ -1112,12 +1109,12 @@ test("a saved capture marker keeps a missing order guarded when execution ended 
     if (path.startsWith("/api/operations/")) return { flow: "card", captureRequested: true,
       order: { id: "MISSING0001", status: "APPROVED" }, traces: { create: savedCreateTrace } };
     if (path === "/api/orders/MISSING0001") return missingOrderResponse("MISSING0001");
-  }, savedBuyer, true, { storage: [["editfi:new:card", oldKey]] });
+  }, savedBuyer, true, { search: "?card=return", storage: [["editfi:new:card", oldKey]] });
   await page.ready();
   await page.openCard();
   assert.equal(page.cardRenders.length, 4);
-  assert.equal(page.element("card-submit").disabled, false);
-  assert.equal(page.element("card-submit").dataset.action, "check");
+  assert.equal(page.element("card-submit").disabled, true);
+  assert.equal(page.element("card-submit").dataset.action, "blocked");
   assert.equal(page.storage.get("editfi:new:card"), oldKey);
   assert.equal(page.requests.some((request) => request.path === "/api/orders"), false);
 });
@@ -1127,116 +1124,181 @@ test("a transient recovery failure still initializes the SDK and preserves the e
   const page = browser("new", (path) => {
     if (path.startsWith("/api/operations/")) return { flow: "card", order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" } };
     if (path === `/api/orders/${complete.id}`) return Response.json({ error: "PAYPAL_UNREACHABLE", message: "PayPal unavailable" }, { status: 502 });
-  }, savedBuyer, true, { storage: [["editfi:new:card", oldKey]] });
+  }, savedBuyer, true, { search: "?card=return", storage: [["editfi:new:card", oldKey]] });
   await page.ready();
   await page.openCard();
   assert.equal(page.cardRenders.length, 4);
   assert.equal(page.element("card-form").hidden, false);
   assert.equal(page.storage.get("editfi:new:card"), oldKey);
-  assert.equal(page.element("check-status").hidden, false);
+  assert.equal(page.element("check-last-order").hidden, false);
 });
 
-test("an operation lookup failure can be checked again after the SDK loads", async () => {
-  let attempts = 0;
-  const page = browser("new", (path) => {
-    if (path.startsWith("/api/operations/")) {
-      if (++attempts === 1) throw new Error("connection lost");
-      return { flow: "card", order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" } };
-    }
-    if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" } };
-  }, savedBuyer, true, { storage: [["editfi:new:card", crypto.randomUUID()]] });
+test("a new checkout discards an old operation key without trying to recover it", async () => {
+  const key = crypto.randomUUID();
+  const page = browser("new", () => undefined, savedBuyer, true, { storage: [["editfi:new:card", key]] });
   await page.ready();
   await page.openCard();
-  assert.equal(page.cardRenders.length, 4);
-  await page.element("check-status").events.click();
-  assert.equal(attempts, 2);
+  assert.equal(page.storage.has("editfi:new:card"), false);
   assert.equal(page.element("card-submit").disabled, false);
-  assert.equal(page.requests.some((request) => request.path === "/api/orders" || request.path.endsWith("/capture")), false);
+  assert.equal(page.element("check-last-order").disabled, true);
+  const before = page.requests.length;
+  await page.element("check-last-order").events.click();
+  assert.equal(page.requests.length, before);
+  assert.equal(page.requests.some((request) => request.path.startsWith("/api/operations/")), false);
 });
 
-for (const flow of ["new", "returning"]) {
-  test(`${flow} primary card button checks a previous unresolved payment and becomes Pay by card after an unpaid result`, async () => {
-    let checks = 0;
-    const key = crypto.randomUUID();
-    const page = browser(flow, (path) => {
-      if (path.startsWith("/api/operations/")) return { flow: "card", captureRequested: true, order: { id: complete.id } };
-      if (path === `/api/orders/${complete.id}`) {
-        if (++checks === 1) throw new Error("status response lost");
-        return { order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" }, captureRequested: false };
-      }
-    }, savedBuyer, true, { storage: [[`editfi:${flow}:card`, key]] });
-    await page.ready();
-    await page.openCard();
-    assert.equal(page.element("card-submit").disabled, false);
-    assert.equal(page.element("card-submit-label").textContent, "Check previous payment");
-    assert.equal(page.element("card-submit-amount").hidden, true);
-    assert.match(page.element("card-action-hint").textContent, new RegExp(complete.id));
-    await page.submitCard();
-    assert.equal(checks, 2);
-    assert.equal(page.element("card-submit").disabled, false);
-    assert.equal(page.element("card-submit-label").textContent, "Pay by card");
-    assert.equal(page.element("card-submit-amount").hidden, false);
-    assert.equal(page.element("card-action-hint").hidden, true);
-    assert.equal(page.cardSubmissions.length, 0);
-    assert.equal(page.requests.every((request) => request.init.method === "GET" || request.path === "/api/client-token"), true);
-    const entries = page.element("activity").textContent.split("\n\n").map((value) => JSON.parse(value));
-    assert.ok(entries.some((entry) => entry.event === "Card checkout state" && entry.data.action === "check" && entry.data.unresolved));
-    assert.ok(entries.some((entry) => entry.event === "Card checkout state" && entry.data.action === "pay" && entry.data.cardMounted));
-  });
-
-  test(`${flow} primary card button explicitly completes the existing approved order without submitting new card details`, async () => {
-    const key = crypto.randomUUID();
-    const page = browser(flow, (path) => {
-      if (path.startsWith("/api/operations/")) return { flow: "card", captureRequested: true, order: { id: complete.id } };
-      if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "APPROVED", cardAuthenticated: true }, captureRequested: true };
-    }, savedBuyer, true, { storage: [[`editfi:${flow}:card`, key]] });
-    await page.ready();
-    await page.openCard();
-    assert.equal(page.element("card-submit").disabled, false);
-    assert.equal(page.element("card-submit-label").textContent, "Complete approved card payment");
-    assert.match(page.element("card-action-hint").textContent, new RegExp(complete.id));
-    assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
-    await page.submitCard();
-    assert.equal(page.cardSubmissions.length, 0);
-    assert.equal(page.requests.some((request) => request.path === "/api/orders"), false);
-    assert.equal(page.requests.filter((request) => request.path === `/api/orders/${complete.id}/capture`).length, 1);
-    assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
-    assert.equal(page.storage.get(`editfi:${flow}:card`), key);
+for (const outcome of ["approved", "pending", "completed", "uncertain"]) {
+  test(`reloading a new checkout after a ${outcome} card attempt permits a fresh payment with a new UUID`, async () => {
+    const first = browser("new", (path) => {
+      if (outcome === "pending" && path.endsWith("/capture")) return { order: { id: complete.id, status: "COMPLETED", completed: false,
+        purchase_units: [{ payments: { captures: [{ id: "PENDING00001", status: "PENDING" }] } }] } };
+      if (outcome === "uncertain" && (path.endsWith("/capture") || path === `/api/orders/${complete.id}`)) throw new Error("response lost");
+      if (outcome === "approved" && path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "APPROVED", cardAuthenticated: true } };
+    }, savedBuyer, true, { cardNoApproval: outcome === "approved" });
+    await first.ready();
+    await first.openCard();
+    first.element("save-card").checked = true;
+    await first.submitCard();
+    const oldRequest = first.requests.find((request) => request.path === "/api/orders").body.requestId;
+    assert.equal(first.storage.get("editfi:last-order:new"), complete.id);
+    const returningKey = crypto.randomUUID();
+    first.storage.set("editfi:returning:card", returningKey);
+    const next = browser("new", undefined, savedBuyer, true, { storage: first.storage });
+    await next.ready();
+    assert.equal(next.element("method-card").checked, false);
+    assert.equal(next.element("save-card").checked, false);
+    assert.equal(next.element("save-paypal").checked, false);
+    assert.equal(next.storage.has("editfi:new:card"), false);
+    assert.equal(next.storage.get("editfi:returning:card"), returningKey);
+    assert.equal(next.element("vault-id").textContent, savedBuyer.vaultId);
+    assert.equal(next.element("check-last-order").disabled, false);
+    assert.equal(next.requests.some((request) => request.path.startsWith("/api/operations/") || request.path.startsWith("/api/orders")), false);
+    await next.openCard();
+    assert.equal(next.element("card-submit").disabled, false);
+    assert.equal(next.element("card-submit-label").textContent, "Pay by card");
+    await next.submitCard();
+    assert.notEqual(next.requests.find((request) => request.path === "/api/orders").body.requestId, oldRequest);
+    assert.match(next.element("status").textContent, /Card payment completed/);
   });
 }
 
-test("a primary status check without an order ID retries only the operation lookup", async () => {
-  let attempts = 0;
-  const page = browser("new", (path) => {
-    if (path.startsWith("/api/operations/")) {
-      if (++attempts === 1) throw new Error("operation lookup failed");
-      return { flow: "card", captureRequested: false, order: { id: complete.id } };
-    }
-    if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "CREATED" }, captureRequested: false };
-  }, savedBuyer, true, { storage: [["editfi:new:card", crypto.randomUUID()]] });
-  await page.ready();
-  await page.openCard();
-  assert.equal(page.element("card-submit-label").textContent, "Check previous payment");
-  await page.submitCard();
-  assert.equal(attempts, 2);
-  assert.equal(page.element("card-submit-label").textContent, "Pay by card");
-  assert.equal(page.requests.every((request) => request.init.method === "GET"), true);
+test("a new-customer PayPal reload starts another checkout and keeps only its prior diagnostic order ID", async () => {
+  const first = browser("new");
+  await first.ready();
+  await first.selectMethod("paypal");
+  first.element("save-paypal").checked = true;
+  await first.callbacks.createOrder();
+  const oldRequest = first.requests.find((request) => request.path === "/api/orders").body.requestId;
+  const next = browser("new", undefined, savedBuyer, true, { storage: first.storage });
+  await next.ready();
+  assert.equal(next.element("save-paypal").checked, false);
+  assert.equal(next.element("check-last-order").disabled, false);
+  assert.equal(next.requests.some((request) => request.path.startsWith("/api/operations/") || request.path.startsWith("/api/orders")), false);
+  await next.selectMethod("paypal");
+  await next.callbacks.createOrder();
+  const input = next.requests.find((request) => request.path === "/api/orders").body;
+  assert.notEqual(input.requestId, oldRequest);
+  assert.equal(input.savePaymentMethod, false);
 });
 
-test("the primary card status action never reissues a direct saved-PayPal charge", async () => {
-  const page = browser("returning", (path) => {
-    if (path === "/api/direct-charge") throw new Error("direct charge response lost");
-    if (path.startsWith("/api/operations/")) return { flow: "direct", order: complete };
+for (const flow of ["new", "returning"]) {
+  test(`${flow} Check last order status logs the full GET response and leaves checkout state untouched`, async () => {
+    const oldId = "PREVIOUS0001";
+    const response = { status: 200, headers: { "paypal-debug-id": "get-debug" }, body: { ...complete, id: oldId,
+      payment_source: { card: { authentication_result: { liability_shift: "POSSIBLE", three_d_secure: { authentication_status: "Y" } } } } } };
+    const page = browser(flow, (path) => {
+      if (path === `/api/orders/${oldId}`) return { order: { ...complete, id: oldId }, traces: { create: createTrace,
+        get: { request: { method: "GET", headers: { Authorization: "[REDACTED]" } }, response } } };
+    }, savedBuyer, true, { storage: [[`editfi:last-order:${flow}`, oldId]] });
+    await page.ready();
+    await page.openCard();
+    const snapshot = () => JSON.stringify([page.element("status").textContent, page.element("card-submit").disabled,
+      page.element("card-submit-label").textContent, page.element("payment-methods").disabled,
+      page.element("payment-order-id").textContent, page.element("payment-capture-id").textContent,
+      page.element("success-actions").hidden, page.element("create-response").textContent]);
+    const before = snapshot(), count = page.requests.length;
+    assert.equal(page.element("check-last-order").textContent, "Check last order status");
+    await page.element("check-last-order").events.click();
+    assert.equal(snapshot(), before);
+    assert.equal(page.requests.length, count + 1);
+    assert.equal(page.requests.at(-1).path, `/api/orders/${oldId}`);
+    assert.equal(page.requests.at(-1).init.method, "GET");
+    const [event, data] = page.consoleLogs.at(-1);
+    assert.equal(event, "Get last order details response");
+    assert.equal(data.orderID, oldId);
+    assert.deepEqual(JSON.parse(JSON.stringify(data.response)), response);
+    assert.match(page.element("activity").textContent, /authentication_status/);
+    assert.equal(JSON.stringify(page.consoleLogs).includes("create-access-token"), false);
+    assert.equal(page.element("check-last-order").disabled, false);
   });
-  await page.ready();
-  await page.element("place-order").events.click();
-  await page.openCard();
-  assert.equal(page.element("card-submit-label").textContent, "Check previous payment");
-  await page.submitCard();
-  assert.equal(page.requests.filter((request) => request.path === "/api/direct-charge").length, 1);
-  assert.equal(page.requests.some((request) => request.path === "/api/orders" || request.path.endsWith("/capture")), false);
-  assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+}
+
+test("the diagnostic button is a no-op without a valid last order ID", async () => {
+  for (const value of [undefined, "../../other-order"]) {
+    const page = browser("new", undefined, savedBuyer, true, { storage: value ? [["editfi:last-order:new", value]] : [] });
+    await page.ready();
+    const before = page.requests.length;
+    assert.equal(page.element("check-last-order").disabled, true);
+    await page.element("check-last-order").events.click();
+    assert.equal(page.requests.length, before);
+    assert.equal(page.consoleLogs.length, 0);
+  }
 });
+
+test("a new attempt without a returned order ID cannot accidentally check the older order", async () => {
+  const page = browser("new", (path) => {
+    if (path === "/api/orders") throw new Error("create response lost");
+  }, savedBuyer, true, { storage: [["editfi:last-order:new", "PREVIOUS0001"]] });
+  await page.ready();
+  assert.equal(page.element("check-last-order").disabled, false);
+  await page.selectMethod("paypal");
+  await assert.rejects(page.callbacks.createOrder());
+  assert.equal(page.element("check-last-order").disabled, true);
+  assert.equal(page.storage.has("editfi:last-order:new"), false);
+  const before = page.requests.length;
+  await page.element("check-last-order").events.click();
+  assert.equal(page.requests.length, before);
+});
+
+test("an unsuccessful diagnostic GET only logs its error and retains the order ID", async () => {
+  const page = browser("new", (path) => {
+    if (path === "/api/orders/MISSING0001") return missingOrderResponse("MISSING0001");
+  }, savedBuyer, true, { storage: [["editfi:last-order:new", "MISSING0001"]] });
+  await page.ready();
+  await page.openCard();
+  const before = page.element("status").textContent;
+  await page.element("check-last-order").events.click();
+  assert.equal(page.element("status").textContent, before);
+  assert.equal(page.element("card-submit").disabled, false);
+  assert.equal(page.storage.get("editfi:last-order:new"), "MISSING0001");
+  assert.equal(page.consoleLogs.at(-1)[0], "Get last order details error");
+  assert.equal(page.consoleLogs.at(-1)[1].response.status, 404);
+  assert.equal(page.element("check-last-order").disabled, false);
+});
+
+test("a slow diagnostic GET cannot block or overwrite a newer payment", async () => {
+  let release;
+  const page = browser("new", (path) => {
+    if (path === "/api/orders/PREVIOUS0001") return new Promise((resolve) => { release = resolve; });
+  }, savedBuyer, true, { storage: [["editfi:last-order:new", "PREVIOUS0001"]] });
+  await page.ready();
+  await page.openCard();
+  const checking = page.element("check-last-order").events.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(page.element("check-last-order").disabled, true);
+  assert.equal(page.element("card-submit").disabled, false);
+  await page.submitCard();
+  const receipt = page.element("status").textContent;
+  release({ order: { id: "PREVIOUS0001", status: "APPROVED" } });
+  await checking;
+  assert.equal(page.element("status").textContent, receipt);
+  assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+  assert.equal(page.storage.get("editfi:last-order:new"), complete.id);
+  assert.match(page.element("check-last-order").title, new RegExp(complete.id));
+  assert.equal(page.requests.filter((request) => request.path === "/api/orders").length, 1);
+  assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
+});
+
 
 test("a loading card button explains the wait and enables payment after all hosted fields finish rendering", async () => {
   let release;
@@ -1263,7 +1325,7 @@ for (const kind of ["card", "direct"]) {
     const page = browser(flow, (path) => {
       if (path.startsWith("/api/operations/")) return { flow: kind, order: complete, traces: { capture: captureTrace } };
       if (path === `/api/orders/${complete.id}`) return missingOrderResponse(complete.id);
-    }, savedBuyer, true, { storage: [[key, crypto.randomUUID()]] });
+    }, savedBuyer, true, { storage: [[key, crypto.randomUUID()]], search: kind === "card" ? "?card=return" : "" });
     await page.ready();
     assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
     assert.match(page.element("status").textContent, /completed/);
@@ -1274,7 +1336,7 @@ for (const kind of ["card", "direct"]) {
 test("a completed capture trace recovers a payment even when its summary was not saved", async () => {
   const page = browser("new", (path) => {
     if (path.startsWith("/api/operations/")) return { flow: "card", order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" }, traces: { capture: captureTrace } };
-  }, savedBuyer, true, { storage: [["editfi:new:card", crypto.randomUUID()]] });
+  }, savedBuyer, true, { search: "?card=return", storage: [["editfi:new:card", crypto.randomUUID()]] });
   await page.ready();
   assert.match(page.element("status").textContent, /Card payment completed/);
   assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
@@ -1359,8 +1421,8 @@ test("saved-card checkout follows 3DS and restores an authenticated order for ex
   assert.equal(input.vaultRevision, savedCardBuyer.revision);
   assert.equal(input.vault_id, undefined);
   assert.equal(first.requests.some((request) => request.path.endsWith("/capture")), false);
-  assert.equal(first.element("card-submit").disabled, false);
-  assert.equal(first.element("card-submit").dataset.action, "check");
+  assert.equal(first.element("card-submit").disabled, true);
+  assert.equal(first.element("card-submit").dataset.action, "blocked");
   const returned = browser("returning", (path) => {
     if (path.startsWith("/api/operations/")) return { order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" }, flow: "saved-card" };
     if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "APPROVED", cardAuthenticated: true } };
@@ -1397,7 +1459,7 @@ test("PayPal remains available alongside a saved card without saving that PayPal
   assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
 });
 
-test("a reloaded card attempt restores its original save consent", async () => {
+test("a reloaded new checkout resets save consent and uses a new operation UUID", async () => {
   const first = browser("new", undefined, savedBuyer, true, { cardFailure: true });
   await first.ready();
   await first.openCard();
@@ -1408,12 +1470,12 @@ test("a reloaded card attempt restores its original save consent", async () => {
     if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" } };
   }, savedBuyer, true, { storage: first.storage, cardFailure: true });
   await restored.ready();
-  assert.equal(restored.element("save-card").checked, true);
+  assert.equal(restored.element("save-card").checked, false);
   await restored.openCard();
   await restored.submitCard();
   const input = restored.requests.find((request) => request.path === "/api/orders").body;
-  assert.equal(input.savePaymentMethod, true);
-  assert.equal(input.requestId, first.requests.find((request) => request.path === "/api/orders").body.requestId);
+  assert.equal(input.savePaymentMethod, false);
+  assert.notEqual(input.requestId, first.requests.find((request) => request.path === "/api/orders").body.requestId);
 });
 
 for (const scenario of [

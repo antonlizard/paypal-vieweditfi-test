@@ -5,15 +5,17 @@ let cardFields, cardMounted = false, cardRendering, cardSubmitting = false, card
 let savePayPalChoice = false, saveCardChoice = false, savedCardAuthenticationUrl;
 let selectedMethod, renderNewPayPalButton, renderCardFields;
 let cardStage = "idle", cardCancelled = false;
-let cardSession, cardFieldElements = [], cardInterrupted = false;
+let cardSession, cardFieldElements = [];
 let cardCaptureAttempted = false;
 let cardNeedsNewOrder = false;
 let recoveryNotice, recoveryAttempted = false;
-let checkingPaymentStatus = false, lastCardControlState;
+let checkingLastOrder = false, diagnosticOrderId, lastCardControlState;
 const activity = [];
 const backendErrors = new WeakSet();
 const context = () => flow === "new" ? "new" : `returning:${buyer?.revision}`;
 const storageKey = (kind) => `editfi:${kind === "card" ? flow : context()}:${kind}`;
+const lastOrderStorageKey = `editfi:last-order:${flow}`;
+const validOrderId = (value) => typeof value === "string" && /^[A-Z0-9]{8,32}$/i.test(value);
 const placeOrderPrompt = 'Payment method approved. Click "Place order with saved method" to complete the purchase.';
 const savedCard = () => buyer?.methodType === "card";
 const savedPayPal = () => flow === "returning" && buyer?.state === "VAULTED" && !savedCard();
@@ -69,22 +71,17 @@ function showApiTraces(traces) {
 
 function cardButtonState() {
   if (paid) return { action: "paid", disabled: true, label: "Payment completed", hint: "" };
-  if (busy || submittingPayment || cardSubmitting || checkingPaymentStatus) return { action: "processing", disabled: true,
-    label: checkingPaymentStatus ? "Checking payment status…" : "Processing payment…",
-    hint: checkingPaymentStatus ? "Checking the previous payment result." : "Please wait for the current payment to finish." };
-  if (unresolved) {
-    if (activeMethod === "card" && approvedCardOrderId) return { action: "capture", disabled: false,
-      label: "Complete approved card payment", hint: `This completes order ${approvedCardOrderId} using the card already approved with 3D Secure.` };
-    return { action: "check", disabled: false, label: "Check previous payment",
-      hint: `Check the previous payment${lastOrderId ? ` (order ${lastOrderId})` : ""} before starting another purchase.` };
-  }
+  if (busy || submittingPayment || cardSubmitting) return { action: "processing", disabled: true,
+    label: "Processing payment…", hint: "Please wait for the current payment to finish." };
+  if (unresolved) return { action: "blocked", disabled: true, label: "Pay by card",
+    hint: flow === "new" ? "Reload this page to start a new test payment." : "The result of this payment attempt is unresolved." };
   if (!cardMounted) return { action: "loading", disabled: true, label: "Loading card fields…",
     hint: "Waiting for secure card fields to finish loading." };
   return { action: "pay", disabled: false, label: "Pay by card", hint: "" };
 }
 
 function controls() {
-  const processing = busy || submittingPayment || cardSubmitting || checkingPaymentStatus;
+  const processing = busy || submittingPayment || cardSubmitting;
   const locked = processing || paid || unresolved;
   if (flow === "new") {
     $("payment-methods").disabled = processing || paid;
@@ -105,7 +102,7 @@ function controls() {
   $("card-action-hint").textContent = cardButton.hint;
   $("card-action-hint").hidden = !cardButton.hint;
   const cardControl = { action: cardButton.action, disabled: cardButton.disabled,
-    busy, submittingPayment, cardSubmitting, checkingPaymentStatus, cardMounted, unresolved, paid,
+    busy, submittingPayment, cardSubmitting, cardMounted, unresolved, paid,
     orderID: lastOrderId || null, stage: cardSession?.stage || "idle" };
   const signature = JSON.stringify(cardControl);
   if (lastCardControlState !== signature) {
@@ -119,8 +116,7 @@ function controls() {
     $("authenticate-saved-card").disabled = busy || submittingPayment;
   }
   for (const id of ["save-paypal", "save-card"]) if ($(id)) $(id).disabled = processing || paid;
-  $("check-status").hidden = paid || (!unresolved && !cardInterrupted);
-  $("check-status").disabled = processing || paid;
+  lastOrderControls();
   $("success-actions").hidden = !paid;
   if (paid) {
     container.hidden = true;
@@ -138,7 +134,7 @@ function showError(error) {
   controls();
 }
 
-async function api(path, body) {
+async function api(path, body, { showTraces = true } = {}) {
   let response;
   try {
     response = await fetch(path, {
@@ -152,8 +148,8 @@ async function api(path, body) {
     throw new Error("The request did not finish. Retry this checkout; its payment idempotency key is preserved.");
   }
   const result = await response.json().catch(() => ({}));
-  if (result.traces) showApiTraces(result.traces);
-  if (result.details?.traces) showApiTraces(result.details.traces);
+  if (showTraces && result.traces) showApiTraces(result.traces);
+  if (showTraces && result.details?.traces) showApiTraces(result.details.traces);
   if (!response.ok) {
     const error = new Error(result.message || `Request failed (${response.status}).`);
     Object.assign(error, { code: result.error, details: result.details, httpStatus: response.status });
@@ -164,8 +160,8 @@ async function api(path, body) {
 }
 
 function requestId(kind) {
-  // Only request identifiers are stored in the browser. The vault ID, REST
-  // secret, access tokens and scoped client token are never saved here.
+  // Browser storage holds request UUIDs and a separate diagnostic order ID.
+  // The vault ID, REST secret and access/client tokens are never saved here.
   let value = sessionStorage.getItem(storageKey(kind));
   if (!value) {
     value = crypto.randomUUID();
@@ -187,6 +183,11 @@ function showBuyer(value) {
 }
 
 function showPaymentDetails(order) {
+  if (validOrderId(order?.id)) {
+    diagnosticOrderId = order.id;
+    sessionStorage.setItem(lastOrderStorageKey, diagnosticOrderId);
+    lastOrderControls();
+  }
   $("payment-details").hidden = !order?.id;
   $("payment-order-id").textContent = order?.id || "—";
   const captureIds = (order?.purchase_units || []).flatMap((unit) =>
@@ -264,8 +265,8 @@ async function createOrder() {
     approvedOrderId = undefined;
   }
   busy = true;
+  clearDiagnosticOrder();
   activeMethod = "paypal";
-  cardInterrupted = false;
   cardCaptureAttempted = false;
   sessionStorage.removeItem(storageKey("card"));
   cardOrderId = approvedCardOrderId = undefined;
@@ -372,14 +373,13 @@ async function recoverCardCapture(orderID, error) {
     // and guard against another payment until its status can be confirmed.
     const noCapture = noCardCapture(error.details);
     unresolved = !paid && !noCapture;
-    cardInterrupted = !paid;
     if (noCapture) cardCaptureAttempted = false;
     busy = false;
     log("Card capture status check failed", { orderID, code: lookupError.code,
       message: lookupError.message, debugId: lookupError.details?.debugId });
     status(`${error.message}${extra} Payment status could not be checked. ${noCapture ?
       "No capture was sent. You can retry checkout or choose another payment method." :
-      "Check payment status before submitting another payment."}`, "error");
+      (flow === "new" ? "Reload this page to start a new test payment." : "Use Check last order status to log the available details.")}`, "error");
     controls();
   }
 }
@@ -488,7 +488,7 @@ async function recoverAttempt() {
         if (!lastOrderId || lastOrderId === orderID) {
           if (cardSession?.orderID === orderID) resetInterruptedCard(cardSession, false);
           lastOrderId = cardOrderId = approvedOrderId = approvedCardOrderId = savedCardAuthenticationUrl = undefined;
-          unresolved = cardInterrupted = cardCaptureAttempted = false;
+          unresolved = cardCaptureAttempted = false;
           busy = false;
           showPaymentDetails(null);
         }
@@ -503,11 +503,10 @@ async function recoverAttempt() {
       lastOrderId = orderID;
       if (activeMethod.includes("card")) cardOrderId = orderID;
       unresolved = !paid;
-      cardInterrupted = activeMethod.includes("card");
       busy = submittingPayment = cardSubmitting = false;
       showPaymentDetails(previous?.order);
       showError(error);
-      recoveryNotice = { message: `The previous checkout${orderID ? ` (${orderID})` : ""} could not be checked. Payment methods are loaded; check payment status before submitting another payment.`, type: "error" };
+      recoveryNotice = { message: `The previous checkout${orderID ? ` (${orderID})` : ""} could not be checked. Payment methods are loaded; use Check last order status to log the available details.`, type: "error" };
       return true;
     }
   }
@@ -515,6 +514,18 @@ async function recoverAttempt() {
 }
 
 async function start() {
+  const query = new URLSearchParams(location.search);
+  const savedOrder = sessionStorage.getItem(lastOrderStorageKey);
+  if (validOrderId(savedOrder)) diagnosticOrderId = savedOrder;
+  const paymentReturn = query.get("card") === "return" || query.get("saved-card") === "return" ||
+    (query.get("paypal") === "return" && validOrderId(query.get("token")));
+  if (flow === "new" && !paymentReturn) {
+    // Each ordinary visit/reload is a fresh test checkout. Retain only the
+    // separate last-order ID for the optional diagnostic GET, never its lock.
+    for (const kind of ["saved-card", "card", "direct", "component"]) sessionStorage.removeItem(storageKey(kind));
+    $("save-paypal").checked = $("save-card").checked = false;
+  }
+  lastOrderControls();
   if (flow === "new") await selectPaymentMethod(undefined);
   configureWalletPlaceholder();
   const [configuration, cached] = await Promise.all([api("/api/config"), api("/api/state")]);
@@ -525,8 +536,7 @@ async function start() {
     element.textContent = new Intl.NumberFormat("en-US", { style: "currency", currency: settings.currency }).format(settings.amount);
   });
   log("Configuration loaded", { environment: settings.environment, amount: settings.amount, currency: settings.currency });
-  const query = new URLSearchParams(location.search);
-  if (query.get("card") || query.get("saved-card")) {
+  if (query.get("card") === "return" || query.get("saved-card") === "return") {
     history.replaceState(null, "", location.pathname);
     // Restore only an order belonging to this browser's card attempt. Redirects
     // and reloads check status; they never submit a fresh payment or capture.
@@ -534,7 +544,7 @@ async function start() {
     if (paid) return;
   }
   if (query.get("paypal") === "cancel") onCancel();
-  if (query.get("paypal") === "return" && query.get("token")) {
+  if (query.get("paypal") === "return" && validOrderId(query.get("token"))) {
     history.replaceState(null, "", location.pathname);
     if (flow === "new") {
       await selectPaymentMethod("paypal");
@@ -558,7 +568,7 @@ async function start() {
     }
     status(buyer ? "Waiting for a vaulted token from PayPal." : "Create a saved buyer in Flow 01 to continue.");
   }
-  if (!recoveryAttempted && !approvedOrderId && !cardOrderId) await recoverAttempt();
+  if (flow === "returning" && !recoveryAttempted && !approvedOrderId && !cardOrderId) await recoverAttempt();
   if (paid) return;
   let token;
   if (savedPayPal()) {
@@ -708,7 +718,6 @@ function resetInterruptedCard(session, captureUncertain) {
   if (session !== cardSession) return;
   session.interrupted = true;
   cardSession = undefined; // Old SDK callbacks and submit promises lose ownership.
-  cardInterrupted = Boolean(cardOrderId);
   busy = submittingPayment = cardSubmitting = false;
   unresolved = captureUncertain;
   approvedCardOrderId = undefined;
@@ -731,7 +740,7 @@ function cardError(error, callback = "sdk-onError", session = cardSession) {
   // recovery. Late iframe errors must not reset fields or replace that result.
   const ignored = !session || session !== cardSession || session.interrupted || session.approvalHandled === true;
   const safe = error && typeof error === "object" && backendErrors.has(error) ? error : new Error(
-    session?.orderID ? "Card submission was interrupted. You can edit the card or choose another method. Check payment status for the 3DS result." :
+    session?.orderID ? "Card submission was interrupted. You can edit the card or choose another method. Use Check last order status to log the 3DS result." :
       "Card payment could not be submitted. Review the card fields, then retry.",
   );
   if (safe !== error) {
@@ -853,11 +862,10 @@ async function restoreCard(result, method = activeMethod.includes("card") ? acti
     sessionStorage.removeItem(storageKey(method === "saved-card" ? "saved-card" : "card"));
   }
   unresolved = !failed && (Boolean(savedCardAuthenticationUrl) || !retryable);
-  cardInterrupted = !paid;
   status(approvedCardOrderId ? "Card payment approved. Click Complete approved card payment to capture this order." : savedCardAuthenticationUrl ? "Complete card authentication before capturing this payment." :
     failed ? `Order ${result.order.id} (${result.order.status}) did not complete payment. You can pay again or choose another method.` :
     retryable ? "Card payment is not approved. Review the card details and retry checkout." :
-      `Order ${result.order.id} (${result.order.status}): the capture result is not confirmed. Check payment status to resolve this attempt.`);
+      `Order ${result.order.id} (${result.order.status}): the capture result is not confirmed. Use Check last order status to log the available details.`);
   controls();
 }
 
@@ -866,8 +874,6 @@ $("card-form").addEventListener("submit", async (event) => {
   if (flow === "new" && selectedMethod !== "card") return;
   const action = cardButtonState();
   if (action.disabled) return;
-  if (action.action === "check") return checkPaymentStatus({ readOnly: true });
-  if (action.action === "capture") return captureOrder(approvedCardOrderId).catch(() => {});
   const session = cardSession;
   const fields = cardFields;
   if (!session) return;
@@ -885,7 +891,7 @@ $("card-form").addEventListener("submit", async (event) => {
       return;
     }
     activeMethod = "card";
-    cardInterrupted = false;
+    clearDiagnosticOrder();
     cardCaptureAttempted = false;
     const saving = flow === "new" && $("save-card").checked;
     if (approvedCardOrderId || cardNeedsNewOrder || saving !== saveCardChoice) sessionStorage.removeItem(storageKey("card"));
@@ -929,6 +935,7 @@ $("resume-card").addEventListener("click", async () => {
 
 async function payWithSavedCard() {
   busy = submittingPayment = true;
+  clearDiagnosticOrder();
   activeMethod = "saved-card";
   cardCaptureAttempted = false;
   cardOrderId = lastOrderId = approvedCardOrderId = savedCardAuthenticationUrl = undefined;
@@ -982,6 +989,7 @@ $("place-order")?.addEventListener("click", async () => {
     return;
   }
   busy = true;
+  clearDiagnosticOrder();
   activeMethod = "paypal";
   sessionStorage.removeItem(storageKey("card"));
   cardOrderId = approvedCardOrderId = undefined;
@@ -1004,46 +1012,44 @@ $("place-order")?.addEventListener("click", async () => {
   }
 });
 
-async function checkPaymentStatus({ readOnly = false } = {}) {
-  if (busy || paid || submittingPayment || cardSubmitting || checkingPaymentStatus) return;
-  checkingPaymentStatus = true;
-  busy = true;
-  controls();
+function clearDiagnosticOrder() {
+  diagnosticOrderId = undefined;
+  sessionStorage.removeItem(lastOrderStorageKey);
+  lastOrderControls();
+}
+
+function lastOrderControls() {
+  const button = $("check-last-order");
+  button.disabled = checkingLastOrder || !diagnosticOrderId;
+  button.textContent = checkingLastOrder ? "Checking last order…" : "Check last order status";
+  button.title = diagnosticOrderId ? `Order ${diagnosticOrderId}` : "No order ID is available from a payment attempt.";
+}
+
+async function checkLastOrderStatus() {
+  if (checkingLastOrder || !diagnosticOrderId) return;
+  const orderID = diagnosticOrderId;
+  checkingLastOrder = true;
+  lastOrderControls();
   try {
-    if (lastOrderId) {
-      const result = await api(`/api/orders/${encodeURIComponent(lastOrderId)}`);
-      if (activeMethod.includes("card")) {
-        await restoreCard(result);
-      } else if (approvedOrderId === lastOrderId && result.order.status === "APPROVED" && !hasCapture(result.order)) {
-        awaitPlacement(result.order);
-      } else {
-        await finish(result);
-      }
-    } else {
-      if (activeMethod.includes("card") || readOnly) {
-        recoveryNotice = undefined;
-        const found = await recoverAttempt();
-        busy = false;
-        controls();
-        if (recoveryNotice) status(recoveryNotice.message, recoveryNotice.type);
-        else if (!found && unresolved) status("The previous payment has no confirmed order result yet. Check payment status again before starting another purchase.");
-        return;
-      }
-      // Recover a direct-charge response lost before the order ID arrived.
-      // Reuse the exact existing key; never create a fresh payment attempt.
-      const key = sessionStorage.getItem(storageKey("direct"));
-      if (!key) throw new Error("No submitted payment was found. Reload to continue.");
-      await finish(await api("/api/direct-charge", { requestId: key, vaultRevision: buyer.revision }));
-    }
+    // This is a diagnostic GET only. Its result never restores a checkout,
+    // changes payment controls, submits card fields, or starts a payment.
+    const result = await api(`/api/orders/${encodeURIComponent(orderID)}`, undefined, { showTraces: false });
+    const data = { orderID, response: result.traces?.get?.response || { status: 200, body: result.order } };
+    log("Get last order details response", data);
+    console.info("Get last order details response", data);
+  } catch (error) {
+    const data = { orderID, code: error.code, message: error.message, debugId: error.details?.debugId,
+      response: error.details?.traces?.get?.response || null };
+    log("Get last order details error", data);
+    console.error("Get last order details error", data);
   }
-  catch (error) { showError(error); }
   finally {
-    checkingPaymentStatus = busy = false;
-    controls();
+    checkingLastOrder = false;
+    lastOrderControls();
   }
 }
 
-$("check-status").addEventListener("click", () => checkPaymentStatus());
+$("check-last-order").addEventListener("click", checkLastOrderStatus);
 
 $("refresh-vault").addEventListener("click", async () => {
   if (busy || unresolved) return;
