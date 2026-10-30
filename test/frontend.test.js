@@ -71,7 +71,13 @@ function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, has
           if (options.cardConfirmWait) await options.cardConfirmWait;
           if (options.cardNoApproval) return;
           try {
-            await configuration.onApprove({ orderID, ...(options.cardApproval || {}) });
+            const approval = configuration.onApprove({ orderID, ...(options.cardApproval || {}) });
+            if (options.sdkDoesNotWaitApproval) {
+              Promise.resolve(approval).catch(configuration.onError);
+              if (options.sdkErrorAfterApproval) throw options.sdkErrorAfterApproval;
+              return;
+            }
+            await approval;
           } catch (error) {
             if (!options.wrapApprovalError) throw error;
             // SDK/iframe boundaries do not preserve the merchant Error identity.
@@ -992,6 +998,28 @@ test("an SDK error while the merchant capture is pending cannot rebuild fields o
   await submitted;
   assert.match(page.element("status").textContent, /Card payment completed/);
 });
+
+for (const outcome of ["resolves", "rejects"]) {
+  test(`submission stays locked when the SDK submit ${outcome} before the merchant capture settles`, async () => {
+    let release;
+    const page = browser("new", (path) => {
+      if (path.endsWith("/capture")) return new Promise((resolve) => { release = resolve; });
+    }, savedBuyer, true, { sdkDoesNotWaitApproval: true,
+      sdkErrorAfterApproval: outcome === "rejects" ? new Error("SDK closed after handing off approval") : undefined });
+    await page.ready();
+    await page.openCard();
+    const submitted = page.submitCard();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(page.element("card-submit").disabled, true);
+    assert.equal(page.element("save-card").disabled, true);
+    assert.equal(page.element("payment-methods").disabled, true);
+    assert.equal(page.cardConfigurations.length, 1);
+    release({ order: complete });
+    await submitted;
+    assert.match(page.element("status").textContent, /Card payment completed/);
+    assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
+  });
+}
 
 test("a completed capture stays successful when refreshing the saved method fails", async () => {
   let states = 0;

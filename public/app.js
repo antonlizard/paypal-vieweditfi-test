@@ -876,6 +876,9 @@ $("card-form").addEventListener("submit", async (event) => {
   } catch (error) { if (!paid) cardError(error, "submit-rejected", session); }
   finally {
     if (session === cardSession) {
+      // The SDK submit promise can settle before the merchant's onApprove
+      // promise. Submission stays locked until capture/recovery also settles.
+      if (session.approvalHandled && cardCapturePromise) await cardCapturePromise;
       busy = submittingPayment = cardSubmitting = false;
       controls();
     }
