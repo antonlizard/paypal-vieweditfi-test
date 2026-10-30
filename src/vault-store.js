@@ -19,6 +19,15 @@ function cardAuthenticated(order) {
   return order.payment_source?.card?.authentication_result?.three_d_secure?.authentication_status === "Y";
 }
 
+function cardCaptureEligible(order) {
+  if (!cardAuthenticated(order)) return false;
+  // fields=payment_source can omit the top-level order status entirely.
+  // Use PayPal's successful 3DS/possible-shift result in that projection;
+  // never substitute attributes.vault.status for the order's status.
+  return order.status === "APPROVED" || (order.status == null &&
+    order.payment_source.card.authentication_result.liability_shift === "POSSIBLE");
+}
+
 function payerActionUrl(order, operation) {
   if (operation?.flow !== "saved-card" || order.status !== "PAYER_ACTION_REQUIRED") return undefined;
   const href = order.links?.find((link) => link.rel === "payer-action" && (!link.method || link.method === "GET"))?.href;
@@ -35,11 +44,17 @@ function payerActionUrl(order, operation) {
 function summary(order, operation) {
   const paypal = order.payment_source?.paypal;
   const card = order.payment_source?.card;
+  const previous = operation?.result;
+  // A payment-source projection does not invalidate captures already recorded
+  // for this order. Keep their known pending/completed result for recovery.
+  const payment = order.purchase_units === undefined && previous?.id === order.id &&
+    previous.purchase_units?.some((unit) => unit.payments?.captures?.length) ?
+    { ...order, status: order.status ?? previous.status, purchase_units: previous.purchase_units } : order;
   return {
     id: order.id,
-    status: order.status,
-    completed: isCompleted(order),
-    ...(card ? { cardAuthenticated: cardAuthenticated(order), payment_source: { card: {
+    status: payment.status ?? null,
+    completed: isCompleted(payment),
+    ...(card ? { cardAuthenticated: cardAuthenticated(order), cardCaptureEligible: cardCaptureEligible(payment), payment_source: { card: {
       brand: card.brand, last_digits: card.last_digits, expiry: card.expiry,
       authentication_result: card.authentication_result, attributes: { vault: card.attributes?.vault },
     } } } : {}),
@@ -49,7 +64,7 @@ function summary(order, operation) {
       account_id: paypal.account_id,
       attributes: { vault: paypal.attributes?.vault },
     } } } : {}),
-    purchase_units: order.purchase_units?.map((unit) => ({
+    purchase_units: payment.purchase_units?.map((unit) => ({
       payments: { captures: unit.payments?.captures?.map(({ id, status, amount }) => ({ id, status, amount })) },
     })),
   };
@@ -318,21 +333,24 @@ export class VaultStore {
       // Read authentication from PayPal, never from browser callbacks. This
       // test harness requires a successful 3DS result before a card capture.
       const { order: verified } = await this.paymentRequest(operation, "get", `${path}?fields=payment_source`, { method: "GET" });
-      if (isCompleted(verified)) {
-        operation.result = summary(verified, operation);
+      const verifiedSummary = summary(verified, operation);
+      const pendingCapture = verifiedSummary.purchase_units?.some((unit) => unit.payments?.captures?.some((item) => item.status === "PENDING"));
+      if (verifiedSummary.completed || pendingCapture) {
+        operation.result = verifiedSummary;
         await this.finish(operation, verified);
         return json({ order: operation.result, flow: operation.flow, captureRequested: operation.captureRequested === true,
           traces: operation.traces || {}, replayed: true });
       }
-      if (verified.status !== "APPROVED" || !cardAuthenticated(verified)) {
-        operation.result = summary(verified, operation);
+      if (!verifiedSummary.cardCaptureEligible) {
+        operation.result = verifiedSummary;
         await this.finish(operation, verified);
         const authentication = verified.payment_source?.card?.authentication_result;
         throw new AppError(409, "CARD_AUTHENTICATION_REQUIRED", "Complete successful 3D Secure authentication before capturing this card order.", {
           order: operation.result, captureRequested: operation.captureRequested === true, traces: operation.traces || {},
           captureCheck: {
-            reason: verified.status !== "APPROVED" ? "ORDER_NOT_APPROVED" : "THREE_DS_NOT_SUCCESSFUL",
-            orderStatus: verified.status ?? null,
+            reason: verifiedSummary.status != null && verifiedSummary.status !== "APPROVED" ? "ORDER_NOT_APPROVED" :
+              !cardAuthenticated(verified) ? "THREE_DS_NOT_SUCCESSFUL" : "LIABILITY_SHIFT_NOT_POSSIBLE",
+            orderStatus: verifiedSummary.status,
             liabilityShift: authentication?.liability_shift ?? null,
             authenticationStatus: authentication?.three_d_secure?.authentication_status ?? null,
           },

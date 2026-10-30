@@ -899,6 +899,29 @@ test("a lookup started before a late approval cannot overwrite the completed cap
   assert.equal(page.element("resume-card").hidden, true);
 });
 
+for (const flow of ["new", "returning"]) {
+  test(`${flow} card return accepts server capture eligibility when payment_source omitted the order status`, async () => {
+    const method = flow === "new" ? "card" : "saved-card";
+    const storageKey = flow === "new" ? "editfi:new:card" : "editfi:returning:revision-1:saved-card";
+    const order = { id: complete.id, status: null, completed: false, cardAuthenticated: true, cardCaptureEligible: true,
+      payment_source: { card: { authentication_result: { liability_shift: "POSSIBLE",
+        three_d_secure: { enrollment_status: "Y", authentication_status: "Y" } }, attributes: { vault: { status: "APPROVED" } } } } };
+    const page = browser(flow, (path) => {
+      if (path.startsWith("/api/operations/")) return { flow: method, order: { id: complete.id }, captureRequested: false };
+      if (path === `/api/orders/${complete.id}`) return { order, captureRequested: false };
+    }, flow === "new" ? savedBuyer : savedCardBuyer, true, {
+      storage: [[storageKey, crypto.randomUUID()]], search: flow === "new" ? "?card=return" : "?saved-card=return",
+    });
+    await page.ready();
+    assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+    assert.equal(page.element("resume-card").hidden, false);
+    assert.doesNotMatch(page.element("status").textContent, /undefined/);
+    await page.element("resume-card").events.click();
+    assert.equal(page.requests.filter((request) => request.path === `/api/orders/${complete.id}/capture`).length, 1);
+    assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
+  });
+}
+
 test("an already-captured API issue cannot be treated as a declined payment", async () => {
   const page = browser("new", (path) => {
     if (path.startsWith("/api/operations/")) return { flow: "card", savePaymentMethod: false, order: { id: complete.id } };

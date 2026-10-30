@@ -20,7 +20,7 @@ function harness() {
   const requestIds = new Map();
   let serial = 0;
   const mock = { vaultStatus: "VAULTED", captureStatus: "COMPLETED", directStatus: "COMPLETED", failCapture: false, loseCreateResponse: false, verification: "SUCCESS", charges: 0,
-    cardAuthenticationStatus: "Y", savedCardApproved: false, loseConfirmResponse: false };
+    cardAuthenticationStatus: "Y", cardLiabilityShift: "POSSIBLE", savedCardApproved: false, loseConfirmResponse: false };
   const env = {
     PAYPAL_ENV: "sandbox", PAYPAL_CLIENT_ID: "sandbox-client-id", PAYPAL_CLIENT_SECRET: "server-only-secret",
     BASIC_AUTH_USERNAME: "editfi", BASIC_AUTH_PASSWORD: "test-only-password", PAYPAL_CURRENCY: "USD", PAYPAL_AMOUNT: "10.00",
@@ -94,11 +94,12 @@ function harness() {
       order.result = completed(order, order.id);
     }
     const cardSource = order.confirmedSource?.card || order.body.payment_source?.card;
-    if (!match[2] && cardSource && !order.result.purchase_units && (!cardSource.vault_id || mock.savedCardApproved)) {
-      return Response.json({ id: order.id, status: "APPROVED", payment_source: { card: {
+    if (!match[2] && cardSource && (!order.result.purchase_units || mock.cardDetailsOnly) && (!cardSource.vault_id || mock.savedCardApproved)) {
+      return Response.json({ id: order.id, ...(mock.cardDetailsOnly ? {} : { status: mock.cardOrderStatus || "APPROVED" }), payment_source: { card: {
         brand: "VISA", last_digits: "1111", authentication_result: {
-          liability_shift: "POSSIBLE", three_d_secure: { enrollment_status: "Y", authentication_status: mock.cardAuthenticationStatus },
+          liability_shift: mock.cardLiabilityShift, three_d_secure: { enrollment_status: "Y", authentication_status: mock.cardAuthenticationStatus },
         },
+        ...(mock.cardDetailsOnly ? { attributes: { vault: { status: "APPROVED" } } } : {}),
       } } });
     }
     return Response.json(order.result, { status: match[2] ? 201 : 200, headers: { "paypal-debug-id": "capture-debug-id" } });
@@ -320,6 +321,115 @@ test("Get Order details retain a redacted request and authentication result with
   const restored = await h.call(`/api/operations/${requestId}`);
   assert.deepEqual(restored.body.traces.get, result.body.traces.get);
   assert.equal(JSON.stringify(result.body).includes("server-access-token"), false);
+});
+
+for (const page of ["new", "returning"]) {
+  test(`${page} card capture accepts the authenticated payment_source projection without an order status`, async () => {
+    const h = harness();
+    let buyer;
+    if (page === "returning") {
+      await h.newCheckout();
+      buyer = (await h.call("/api/state")).body.buyer;
+    }
+    h.mock.cardDetailsOnly = true;
+    const requestId = crypto.randomUUID();
+    const created = await h.call("/api/orders", { flow: "card", page, savePaymentMethod: page === "new", requestId });
+    const id = created.body.order.id;
+    const before = h.calls.filter((call) => call.path.endsWith("/capture")).length;
+    const captured = await h.call(`/api/orders/${id}/capture`, {});
+    assert.equal(captured.status, 200);
+    assert.equal(captured.body.traces.get.response.body.status, undefined);
+    assert.equal(captured.body.traces.get.response.body.payment_source.card.authentication_result.three_d_secure.authentication_status, "Y");
+    assert.equal(captured.body.traces.get.response.body.payment_source.card.authentication_result.liability_shift, "POSSIBLE");
+    assert.equal(captured.body.order.completed, true);
+    assert.equal(captured.body.order.purchase_units[0].payments.captures[0].status, "COMPLETED");
+    const captureCall = h.calls.filter((call) => call.path.endsWith("/capture")).at(-1);
+    assert.equal(captureCall.path, `/v2/checkout/orders/${id}/capture`);
+    assert.deepEqual(captureCall.body, {});
+    assert.equal(captureCall.headers["PayPal-Request-Id"], `capture-${id}`);
+    assert.equal(h.calls.filter((call) => call.path.endsWith("/capture")).length, before + 1);
+    await h.call(`/api/orders/${id}/capture`, {});
+    assert.equal(h.calls.filter((call) => call.path.endsWith("/capture")).length, before + 1);
+    if (page === "new") {
+      assert.equal((await h.call("/api/state")).body.buyer.methodType, "card");
+    } else assert.deepEqual((await h.call("/api/state")).body.buyer, buyer);
+    assert.equal(JSON.stringify(captured.body).includes("server-access-token"), false);
+  });
+}
+
+test("a saved card can be explicitly captured after a 3DS return containing only payment_source", async () => {
+  const h = harness();
+  const buyer = await saveCard(h);
+  h.mock.cardDetailsOnly = true;
+  const created = await h.call("/api/orders", { flow: "saved-card", requestId: crypto.randomUUID(), vaultRevision: buyer.revision });
+  h.mock.savedCardApproved = true;
+  const id = created.body.order.id;
+  const before = h.calls.filter((call) => call.path.endsWith("/capture")).length;
+  const details = await h.call(`/api/orders/${id}`);
+  assert.equal(details.body.order.status, null);
+  assert.equal(details.body.order.cardCaptureEligible, true);
+  assert.equal(details.body.traces.get.response.body.status, undefined);
+  assert.equal(h.calls.filter((call) => call.path.endsWith("/capture")).length, before);
+  const result = await h.call(`/api/orders/${id}/capture`, {});
+  assert.equal(result.status, 200);
+  assert.equal(result.body.order.completed, true);
+  assert.deepEqual((await h.call("/api/state")).body.buyer, buyer);
+});
+
+test("vault APPROVED alone does not permit capture from a partial card response", async () => {
+  const h = harness();
+  h.mock.cardDetailsOnly = true;
+  const created = await h.call("/api/orders", { flow: "card", page: "new", requestId: crypto.randomUUID() });
+  for (const status of ["N", "R", "U", "C", "A", undefined]) {
+    h.mock.cardAuthenticationStatus = status;
+    const result = await h.call(`/api/orders/${created.body.order.id}/capture`, {});
+    assert.equal(result.body.error, "CARD_AUTHENTICATION_REQUIRED");
+    assert.equal(result.body.details.captureCheck.reason, "THREE_DS_NOT_SUCCESSFUL");
+    assert.equal(result.body.details.order.cardCaptureEligible, false);
+  }
+  assert.equal(h.calls.some((call) => call.path.endsWith("/capture")), false);
+});
+
+test("an omitted order status requires POSSIBLE as well as successful card authentication", async () => {
+  const h = harness();
+  h.mock.cardDetailsOnly = true;
+  const created = await h.call("/api/orders", { flow: "card", page: "new", requestId: crypto.randomUUID() });
+  for (const shift of ["NO", "UNKNOWN", undefined]) {
+    h.mock.cardLiabilityShift = shift;
+    const result = await h.call(`/api/orders/${created.body.order.id}/capture`, {});
+    assert.equal(result.body.error, "CARD_AUTHENTICATION_REQUIRED");
+    assert.equal(result.body.details.captureCheck.reason, "LIABILITY_SHIFT_NOT_POSSIBLE");
+  }
+  assert.equal(h.calls.some((call) => call.path.endsWith("/capture")), false);
+});
+
+test("an explicit unapproved order status still prevents capture after successful 3DS", async () => {
+  const h = harness();
+  const created = await h.call("/api/orders", { flow: "card", page: "new", requestId: crypto.randomUUID() });
+  for (const status of ["CREATED", "PAYER_ACTION_REQUIRED", "VOIDED", "COMPLETED"]) {
+    h.mock.cardOrderStatus = status;
+    const result = await h.call(`/api/orders/${created.body.order.id}/capture`, {});
+    assert.equal(result.body.details.captureCheck.reason, "ORDER_NOT_APPROVED");
+  }
+  assert.equal(h.calls.some((call) => call.path.endsWith("/capture")), false);
+});
+
+test("a payment_source projection retains a known pending capture and cannot dispatch capture again", async () => {
+  const h = harness();
+  h.mock.cardDetailsOnly = true;
+  h.mock.captureStatus = "PENDING";
+  const created = await h.call("/api/orders", { flow: "card", page: "new", requestId: crypto.randomUUID() });
+  const id = created.body.order.id;
+  const first = await h.call(`/api/orders/${id}/capture`, {});
+  assert.equal(first.body.order.completed, false);
+  const details = await h.call(`/api/orders/${id}`);
+  assert.equal(details.body.traces.get.response.body.status, undefined);
+  assert.equal(details.body.order.purchase_units[0].payments.captures[0].status, "PENDING");
+  assert.equal(details.body.order.cardCaptureEligible, false);
+  const retry = await h.call(`/api/orders/${id}/capture`, {});
+  assert.equal(retry.body.replayed, true);
+  assert.equal(retry.body.order.completed, false);
+  assert.equal(h.calls.filter((call) => call.path.endsWith("/capture")).length, 1);
 });
 
 test("a missing PayPal order preserves its 404 details and trace for safe checkout recovery", async () => {

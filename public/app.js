@@ -220,7 +220,7 @@ async function finish(result) {
     const saving = flow === "new" && (activeMethod === "card" ? saveCardChoice : savePayPalChoice);
     status(`${activeMethod.includes("card") ? "Card payment" : "Payment"} completed. Order ${order.id}.${saving && current && current.buyer?.state !== "VAULTED" ? " Vaulting is pending; refresh the saved method before using it." : ""}`, "success");
   } else {
-    status(`Order ${order.id}: ${order.status}. Payment is not confirmed. Check its status before starting another purchase.`);
+    status(`Order ${order.id}: ${order.status || "status not returned"}. Payment is not confirmed. Check its status before starting another purchase.`);
   }
   controls();
 }
@@ -859,14 +859,15 @@ async function restoreCard(result, method = activeMethod.includes("card") ? acti
     ...(/^[YNU]$/.test(threeDS?.enrollment_status || "") ? { enrollmentStatus: threeDS.enrollment_status } : {}),
   });
   const alreadyCaptured = result.traces?.capture?.response?.body?.details?.some((detail) => detail.issue === "ORDER_ALREADY_CAPTURED");
-  approvedCardOrderId = !alreadyCaptured && result.order.status === "APPROVED" && result.order.cardAuthenticated === true ? result.order.id : undefined;
+  const captureEligible = result.order.cardCaptureEligible ?? (result.order.status === "APPROVED" && result.order.cardAuthenticated === true);
+  approvedCardOrderId = !alreadyCaptured && captureEligible ? result.order.id : undefined;
   savedCardAuthenticationUrl = method === "saved-card" ? result.order.payerActionUrl : undefined;
   // A confirmed unapproved order can be retried with the SAME create key. A
   // previous capture attempt always keeps the checkout locked for recovery.
   const captureAttempted = result.captureRequested === true || result.traces?.capture?.attempted || result.traces?.capture?.response ||
     (result.captureRequested !== false && cardCaptureAttempted);
   cardCaptureAttempted = Boolean(captureAttempted);
-  const retryable = failed || (!captureAttempted && (method === "card" ? ["CREATED", "SAVED", "APPROVED", "PAYER_ACTION_REQUIRED"].includes(result.order.status) :
+  const retryable = failed || (!captureAttempted && (method === "card" ? captureEligible || ["CREATED", "SAVED", "APPROVED", "PAYER_ACTION_REQUIRED"].includes(result.order.status) :
     ["CREATED", "PAYER_ACTION_REQUIRED"].includes(result.order.status)));
   cardNeedsNewOrder = retryable && !["CREATED", "PAYER_ACTION_REQUIRED"].includes(result.order.status);
   if (failed) {
@@ -875,10 +876,11 @@ async function restoreCard(result, method = activeMethod.includes("card") ? acti
     sessionStorage.removeItem(storageKey(method === "saved-card" ? "saved-card" : "card"));
   }
   unresolved = !failed && (Boolean(savedCardAuthenticationUrl) || !retryable);
-  status(approvedCardOrderId ? "Card payment approved. Click Complete approved card payment to capture this order." : savedCardAuthenticationUrl ? "Complete card authentication before capturing this payment." :
-    failed ? `Order ${result.order.id} (${result.order.status}) did not complete payment. You can pay again or choose another method.` :
+  const orderStatus = result.order.status || "status not returned";
+  status(approvedCardOrderId ? "Card authentication succeeded. Click Complete approved card payment to capture this order." : savedCardAuthenticationUrl ? "Complete card authentication before capturing this payment." :
+    failed ? `Order ${result.order.id} (${orderStatus}) did not complete payment. You can pay again or choose another method.` :
     retryable ? "Card payment is not approved. Review the card details and retry checkout." :
-      `Order ${result.order.id} (${result.order.status}): the capture result is not confirmed. Use Check last order status to log the available details.`);
+      `Order ${result.order.id} (${orderStatus}): the capture result is not confirmed. Use Check last order status to log the available details.`);
   controls();
 }
 
