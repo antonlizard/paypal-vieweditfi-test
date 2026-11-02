@@ -485,7 +485,7 @@ for (const flow of ["new", "returning"]) {
     assert.equal(page.requests.some((request) => request.path === "/api/direct-charge"), false);
     assert.equal(page.element("payment-order-id").textContent, complete.id);
     assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
-    assert.match(page.element("status").textContent, /Card payment completed/);
+    assert.equal(page.element("status").textContent, "Card payment completed. Capture ID - CAPTURE00001.");
     assert.equal(page.element("status").textContent.includes("Vaulting is pending"), false);
     assert.equal(page.element("alternative-controls").hidden, true);
     assert.deepEqual(page.cardSubmissions, [undefined]);
@@ -1550,7 +1550,7 @@ test("saved-card checkout authenticates in an iframe and captures the same order
   assert.deepEqual(page.requests.find((request) => request.path.endsWith("/capture")).body, {});
   assert.equal(page.element("payment-capture-id").textContent, "CAPTURE00001");
   assert.match(page.element("activity").textContent, /Saved card 3DS capture decision/);
-  assert.match(page.element("status").textContent, /Card payment completed/);
+  assert.equal(page.element("status").textContent, "Card payment completed. Capture ID - CAPTURE00001.");
 });
 
 test("saved-card iframe messages require the active frame, merchant origin, matching state, and expected result", async () => {

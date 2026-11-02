@@ -212,6 +212,7 @@ function showPaymentDetails(order) {
   $("payment-capture-details").hidden = captureIds.length === 0;
   $("payment-capture-label").textContent = captureIds.length > 1 ? "Transaction IDs (capture IDs)" : "Transaction ID (capture ID)";
   $("payment-capture-id").textContent = captureIds.join(", ") || "—";
+  return captureIds;
 }
 
 async function finish(result) {
@@ -219,7 +220,7 @@ async function finish(result) {
   if (!order?.id) throw new Error("The server did not return an order ID.");
   if (activeMethod.includes("card") && failedCardPayment(order, result.traces)) return restoreCard(result);
   lastOrderId = order.id;
-  showPaymentDetails(order);
+  const captureIds = showPaymentDetails(order);
   log("Orders v2 response", order);
   paid = order.completed === true;
   unresolved = !paid;
@@ -234,7 +235,8 @@ async function finish(result) {
   }
   if (paid) {
     const saving = flow === "new" && (activeMethod === "card" ? saveCardChoice : savePayPalChoice);
-    status(`${activeMethod.includes("card") ? "Card payment" : "Payment"} completed. Order ${order.id}.${saving && current && current.buyer?.state !== "VAULTED" ? " Vaulting is pending; refresh the saved method before using it." : ""}`, "success");
+    const message = activeMethod.includes("card") ? `Card payment completed. Capture ID - ${captureIds.join(", ") || "—"}.` : `Payment completed. Order ${order.id}.`;
+    status(`${message}${saving && current && current.buyer?.state !== "VAULTED" ? " Vaulting is pending; refresh the saved method before using it." : ""}`, "success");
   } else {
     status(`Order ${order.id}: ${order.status || "status not returned"}. Payment is not confirmed. Check its status before starting another purchase.`);
   }
