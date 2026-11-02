@@ -541,6 +541,15 @@ async function start() {
   const [configuration, cached] = await Promise.all([api("/api/config"), api("/api/state")]);
   settings = configuration;
   buyer = cached.buyer;
+  const freshSavedCardCheckout = flow === "returning" && savedCard() && !paymentReturn;
+  if (freshSavedCardCheckout) {
+    // An ordinary saved-card page load starts another sandbox purchase. Keep
+    // the shared vaulted method and diagnostic order ID, but discard browser
+    // attempt keys so an earlier checkout cannot restore its payment lock.
+    for (const kind of ["saved-card", "card", "direct", "component"]) sessionStorage.removeItem(storageKey(kind));
+    showPaymentDetails(null);
+    log("Fresh saved-card checkout", { previousAttemptRestored: false });
+  }
   showBuyer(buyer);
   document.querySelectorAll("[data-amount]").forEach((element) => {
     element.textContent = new Intl.NumberFormat("en-US", { style: "currency", currency: settings.currency }).format(settings.amount);
@@ -578,7 +587,7 @@ async function start() {
     }
     status(buyer ? "Waiting for a vaulted token from PayPal." : "Create a saved buyer in Flow 01 to continue.");
   }
-  if (flow === "returning" && !recoveryAttempted && !approvedOrderId && !cardOrderId) await recoverAttempt();
+  if (flow === "returning" && !freshSavedCardCheckout && !recoveryAttempted && !approvedOrderId && !cardOrderId) await recoverAttempt();
   if (paid) return;
   let token;
   if (savedPayPal()) {

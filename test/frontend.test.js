@@ -1545,19 +1545,67 @@ test("saved-card checkout follows 3DS and automatically captures the already pla
   assert.equal(reloaded.element("payment-capture-id").textContent, "CAPTURE00001");
 });
 
-test("ordinary returning-customer reloads restore a saved card without starting capture", async () => {
-  const page = browser("returning", (path) => {
-    if (path.startsWith("/api/operations/")) return { flow: "saved-card", order: { id: complete.id }, captureRequested: false };
-    if (path === `/api/orders/${complete.id}`) return { flow: "saved-card", order: {
-      id: complete.id, status: null, cardAuthenticated: true, cardCaptureEligible: true,
-    }, captureRequested: false };
-  }, savedCardBuyer, true, { storage: [["editfi:returning:revision-1:saved-card", crypto.randomUUID()]] });
-  await page.ready();
-  assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
-  assert.equal(page.element("resume-card").hidden, false);
-  await page.element("check-last-order").events.click();
-  assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
-});
+for (const outcome of ["awaiting-3ds", "approved", "pending", "completed", "uncertain", "failed-create"]) {
+  test(`a saved-card reload after ${outcome} starts a fresh enabled checkout and keeps the vault and diagnostic ID`, async () => {
+    const payerActionUrl = "https://www.sandbox.paypal.com/webapps/helios?flow=3ds&cart_id=ORDER00001";
+    const first = browser("returning", (path) => {
+      if (path === "/api/orders") return outcome === "failed-create" ? Response.json({
+        error: "PAYPAL_UNREACHABLE", message: "Create response lost.",
+      }, { status: 502 }) : { flow: "saved-card", order: { id: complete.id, status: "PAYER_ACTION_REQUIRED", payerActionUrl } };
+    }, savedCardBuyer);
+    await first.ready();
+    await first.element("place-order").events.click();
+    const oldKey = first.requests.find((request) => request.path === "/api/orders").body.requestId;
+    const previous = outcome === "completed" ? complete : { id: complete.id,
+      status: outcome === "awaiting-3ds" ? "PAYER_ACTION_REQUIRED" : outcome === "approved" ? null : "APPROVED",
+      cardAuthenticated: outcome === "approved", cardCaptureEligible: outcome === "approved",
+      ...(outcome === "pending" ? { purchase_units: [{ payments: { captures: [{ id: "PENDING0001", status: "PENDING" }] } }] } : {}),
+    };
+    // Include unrelated browser attempts to ensure none can relock this page.
+    first.storage.set("editfi:returning:card", crypto.randomUUID());
+    first.storage.set("editfi:returning:revision-1:component", crypto.randomUUID());
+    first.storage.set("editfi:returning:revision-1:direct", crypto.randomUUID());
+    const newPageAttempt = crypto.randomUUID();
+    first.storage.set("editfi:new:card", newPageAttempt);
+    const page = browser("returning", (path) => {
+      if (path.startsWith("/api/operations/")) return { flow: "saved-card", order: previous,
+        captureRequested: ["pending", "completed", "uncertain"].includes(outcome) };
+      if (path === `/api/orders/${complete.id}`) return { flow: "saved-card", order: previous };
+      if (path === "/api/orders") return { flow: "saved-card", order: { id: "FRESHORDER01", status: "PAYER_ACTION_REQUIRED", payerActionUrl } };
+    }, savedCardBuyer, true, { storage: first.storage });
+    await page.ready();
+    assert.equal(page.element("place-order").disabled, false);
+    assert.equal(page.element("checkout-controls").inert, false);
+    assert.equal(page.element("checkout-controls").hidden, false);
+    assert.equal(page.element("resume-card").hidden, true);
+    assert.equal(page.element("authenticate-saved-card").hidden, true);
+    assert.equal(page.element("payment-details").hidden, true);
+    assert.equal(page.requests.some((request) => request.path.startsWith("/api/operations/") || request.path.startsWith("/api/orders")), false);
+    assert.deepEqual(page.navigations, []);
+    assert.equal(page.element("vault-id").textContent, savedCardBuyer.vaultId);
+    assert.match(page.element("saved-card-description").textContent, /VISA.*1111/);
+    for (const key of ["editfi:returning:card", ...["saved-card", "component", "direct"].map((kind) => `editfi:returning:revision-1:${kind}`)]) {
+      assert.equal(page.storage.has(key), false);
+    }
+    assert.equal(page.storage.get("editfi:new:card"), newPageAttempt);
+    assert.equal(page.element("check-last-order").disabled, outcome === "failed-create");
+    if (outcome !== "failed-create") {
+      await page.element("check-last-order").events.click();
+      assert.match(page.element("activity").textContent, /Get last order details response/);
+      assert.equal(page.element("place-order").disabled, false);
+      assert.equal(page.element("checkout-controls").inert, false);
+    }
+    assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+    await page.element("place-order").events.click();
+    const created = page.requests.find((request) => request.path === "/api/orders");
+    assert.equal(created.body.flow, "saved-card");
+    assert.equal(created.body.vaultRevision, savedCardBuyer.revision);
+    assert.notEqual(created.body.requestId, oldKey);
+    assert.equal(page.requests.some((request) => request.path.endsWith("/capture") || request.path === "/api/direct-charge"), false);
+    assert.deepEqual(page.navigations, [payerActionUrl]);
+    assert.equal(page.element("payment-order-id").textContent, "FRESHORDER01");
+  });
+}
 
 test("saved-card 3DS returns cannot capture failed, incomplete, or unapproved authentication", async () => {
   for (const status of [null, "PAYER_ACTION_REQUIRED", "VOIDED"]) {
