@@ -445,7 +445,7 @@ function recoveryMayHavePayment(kind, previous) {
     previous?.traces?.capture?.attempted === true;
 }
 
-async function recoverAttempt() {
+async function recoverAttempt({ completeSavedCardReturn = false } = {}) {
   recoveryAttempted = true;
   for (const kind of ["saved-card", "card", "direct", "component"]) {
     const key = sessionStorage.getItem(storageKey(kind));
@@ -471,6 +471,16 @@ async function recoverAttempt() {
       const result = await api(`/api/orders/${encodeURIComponent(previous.order.id)}`);
       if (["card", "saved-card"].includes(kind)) {
         await restoreCard(result, kind);
+        if (completeSavedCardReturn && kind === "saved-card") {
+          // Place order authorized this purchase before the issuer redirect.
+          // Continue that same operation only after server-verified 3DS, with
+          // positive confirmation that no capture has already been dispatched.
+          const continuePayment = previous.flow === "saved-card" && result.flow === "saved-card" &&
+            approvedCardOrderId === previous.order.id && noCardCapture(previous) && noCardCapture(result);
+          log("Saved card 3DS return", { orderID: previous.order.id,
+            backendCaptureRequest: continuePayment ? "REQUESTED" : "NOT_REQUESTED" });
+          if (continuePayment) await captureOrder(approvedCardOrderId);
+        }
         return true;
       }
       if (result.order.completed || kind === "direct" || hasCapture(result.order)) {
@@ -538,9 +548,9 @@ async function start() {
   log("Configuration loaded", { environment: settings.environment, amount: settings.amount, currency: settings.currency });
   if (query.get("card") === "return" || query.get("saved-card") === "return") {
     history.replaceState(null, "", location.pathname);
-    // Restore only an order belonging to this browser's card attempt. Redirects
-    // and reloads check status; they never submit a fresh payment or capture.
-    await recoverAttempt();
+    // A saved-card issuer return continues the purchase already placed by the
+    // buyer. Other card returns and ordinary reloads only restore the attempt.
+    await recoverAttempt({ completeSavedCardReturn: flow === "returning" && query.get("saved-card") === "return" });
     if (paid) return;
   }
   if (query.get("paypal") === "cancel") onCancel();

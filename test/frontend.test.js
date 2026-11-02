@@ -908,13 +908,13 @@ for (const flow of ["new", "returning"]) {
         three_d_secure: { enrollment_status: "Y", authentication_status: "Y" } }, attributes: { vault: { status: "APPROVED" } } } } };
     const page = browser(flow, (path) => {
       if (path.startsWith("/api/operations/")) return { flow: method, order: { id: complete.id }, captureRequested: false };
-      if (path === `/api/orders/${complete.id}`) return { order, captureRequested: false };
+      if (path === `/api/orders/${complete.id}`) return { flow: method, order, captureRequested: false };
     }, flow === "new" ? savedBuyer : savedCardBuyer, true, {
       storage: [[storageKey, crypto.randomUUID()]], search: flow === "new" ? "?card=return" : "?saved-card=return",
     });
     await page.ready();
-    assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
-    assert.equal(page.element("resume-card").hidden, false);
+    assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, flow === "new" ? 0 : 1);
+    assert.equal(page.element("resume-card").hidden, flow !== "new");
     assert.doesNotMatch(page.element("status").textContent, /undefined/);
     await page.element("resume-card").events.click();
     assert.equal(page.requests.filter((request) => request.path === `/api/orders/${complete.id}/capture`).length, 1);
@@ -1508,7 +1508,7 @@ test("a saved card is offered with fresh card fields, PayPal, and a wallet witho
   assert.equal(page.cardRenders.length, 4);
 });
 
-test("saved-card checkout follows 3DS and restores an authenticated order for explicit capture", async () => {
+test("saved-card checkout follows 3DS and automatically captures the already placed order on return", async () => {
   const payerActionUrl = "https://www.sandbox.paypal.com/webapps/helios?flow=3ds&cart_id=ORDER00001";
   const first = browser("returning", (path) => {
     if (path === "/api/orders") return { order: { id: complete.id, status: "PAYER_ACTION_REQUIRED", payerActionUrl } };
@@ -1524,15 +1524,116 @@ test("saved-card checkout follows 3DS and restores an authenticated order for ex
   assert.equal(first.element("card-submit").disabled, true);
   assert.equal(first.element("card-submit").dataset.action, "blocked");
   const returned = browser("returning", (path) => {
-    if (path.startsWith("/api/operations/")) return { order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" }, flow: "saved-card" };
-    if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "APPROVED", cardAuthenticated: true } };
+    if (path.startsWith("/api/operations/")) return { order: { id: complete.id, status: "PAYER_ACTION_REQUIRED" }, flow: "saved-card", captureRequested: false };
+    if (path === `/api/orders/${complete.id}`) return { order: { id: complete.id, status: "APPROVED", cardAuthenticated: true, cardCaptureEligible: true }, flow: "saved-card", captureRequested: false };
   }, savedCardBuyer, true, { storage: first.storage, search: "?saved-card=return" });
   await returned.ready();
-  assert.equal(returned.requests.some((request) => request.path.endsWith("/capture")), false);
-  assert.equal(returned.element("resume-card").hidden, false);
+  assert.equal(returned.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
+  assert.equal(returned.element("resume-card").hidden, true);
   await returned.element("resume-card").events.click();
   assert.equal(returned.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
+  assert.equal(returned.requests.some((request) => request.path === "/api/orders" || request.path === "/api/direct-charge"), false);
+  assert.deepEqual(returned.requests.find((request) => request.path.endsWith("/capture")).body, {});
   assert.equal(returned.element("payment-capture-id").textContent, "CAPTURE00001");
+  assert.match(returned.element("activity").textContent, /Saved card 3DS return/);
+  assert.match(returned.element("status").textContent, /Card payment completed/);
+  const reloaded = browser("returning", (path) => {
+    if (path.startsWith("/api/operations/")) return { flow: "saved-card", order: complete, captureRequested: true };
+  }, savedCardBuyer, true, { storage: returned.storage, search: "?saved-card=return" });
+  await reloaded.ready();
+  assert.equal(reloaded.requests.some((request) => request.path.endsWith("/capture")), false);
+  assert.equal(reloaded.element("payment-capture-id").textContent, "CAPTURE00001");
+});
+
+test("ordinary returning-customer reloads restore a saved card without starting capture", async () => {
+  const page = browser("returning", (path) => {
+    if (path.startsWith("/api/operations/")) return { flow: "saved-card", order: { id: complete.id }, captureRequested: false };
+    if (path === `/api/orders/${complete.id}`) return { flow: "saved-card", order: {
+      id: complete.id, status: null, cardAuthenticated: true, cardCaptureEligible: true,
+    }, captureRequested: false };
+  }, savedCardBuyer, true, { storage: [["editfi:returning:revision-1:saved-card", crypto.randomUUID()]] });
+  await page.ready();
+  assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+  assert.equal(page.element("resume-card").hidden, false);
+  await page.element("check-last-order").events.click();
+  assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+});
+
+test("saved-card 3DS returns cannot capture failed, incomplete, or unapproved authentication", async () => {
+  for (const status of [null, "PAYER_ACTION_REQUIRED", "VOIDED"]) {
+    const page = browser("returning", (path) => {
+      if (path.startsWith("/api/operations/")) return { flow: "saved-card", order: { id: complete.id }, captureRequested: false };
+      if (path === `/api/orders/${complete.id}`) return { flow: "saved-card", order: {
+        id: complete.id, status, cardAuthenticated: status !== null, cardCaptureEligible: false,
+      }, captureRequested: false };
+    }, savedCardBuyer, true, { storage: [["editfi:returning:revision-1:saved-card", crypto.randomUUID()]], search: "?saved-card=return" });
+    await page.ready();
+    assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+    assert.equal(page.element("resume-card").hidden, true);
+  }
+});
+
+test("saved-card return requires matching operation and order details with confirmed unsent capture", async () => {
+  for (const variant of ["operation-flow", "details-flow", "order-id", "operation-marker", "details-marker", "prior-capture", "new-capture", "capture-trace"]) {
+    const previous = { flow: "saved-card", order: { id: complete.id }, captureRequested: false };
+    const result = { flow: "saved-card", order: { id: complete.id, status: "APPROVED", cardAuthenticated: true, cardCaptureEligible: true }, captureRequested: false };
+    if (variant === "operation-flow") previous.flow = "card";
+    if (variant === "details-flow") result.flow = "card";
+    if (variant === "order-id") result.order.id = "OTHERORDER01";
+    if (variant === "operation-marker") delete previous.captureRequested;
+    if (variant === "details-marker") delete result.captureRequested;
+    if (variant === "prior-capture") previous.captureRequested = true;
+    if (variant === "new-capture") result.captureRequested = true;
+    if (variant === "capture-trace") previous.traces = { capture: { ...captureTrace, response: undefined } };
+    const page = browser("returning", (path) => {
+      if (path.startsWith("/api/operations/")) return previous;
+      if (path === `/api/orders/${complete.id}`) return result;
+    }, savedCardBuyer, true, { storage: [["editfi:returning:revision-1:saved-card", crypto.randomUUID()]], search: "?saved-card=return" });
+    await page.ready();
+    assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false, variant);
+  }
+});
+
+test("a saved-card return URL alone cannot start a payment or capture another card flow", async () => {
+  for (const kind of [null, "card"]) {
+    const page = browser("returning", (path) => {
+      if (path.startsWith("/api/operations/")) return { flow: "card", order: { id: complete.id }, captureRequested: false };
+      if (path === `/api/orders/${complete.id}`) return { flow: "card", order: {
+        id: complete.id, status: "APPROVED", cardAuthenticated: true, cardCaptureEligible: true,
+      }, captureRequested: false };
+    }, savedCardBuyer, true, { storage: kind ? [["editfi:returning:card", crypto.randomUUID()]] : [], search: "?saved-card=return" });
+    await page.ready();
+    assert.equal(page.requests.some((request) => request.path === "/api/orders" || request.path.endsWith("/capture")), false);
+  }
+});
+
+test("a saved-card return restores pending captures without dispatching again", async () => {
+  const pending = { ...complete, status: "APPROVED", completed: false, purchase_units: [{ payments: { captures: [{ id: "PENDINGCAPTURE01", status: "PENDING" }] } }] };
+  const page = browser("returning", (path) => {
+    if (path.startsWith("/api/operations/")) return { flow: "saved-card", order: pending, captureRequested: true };
+    if (path === `/api/orders/${complete.id}`) return { flow: "saved-card", order: pending, captureRequested: true };
+  }, savedCardBuyer, true, { storage: [["editfi:returning:revision-1:saved-card", crypto.randomUUID()]], search: "?saved-card=return" });
+  await page.ready();
+  assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+  assert.equal(page.element("resume-card").hidden, true);
+  assert.equal(page.element("place-order").disabled, true);
+});
+
+test("a failed post-3DS saved-card capture keeps its error and never starts a replacement purchase", async () => {
+  const page = browser("returning", (path) => {
+    if (path.startsWith("/api/operations/")) return { flow: "saved-card", order: { id: complete.id }, captureRequested: false };
+    if (path === `/api/orders/${complete.id}`) return { flow: "saved-card", order: {
+      id: complete.id, status: null, cardAuthenticated: true, cardCaptureEligible: true,
+    }, captureRequested: page.requests.some((request) => request.path.endsWith("/capture")) };
+    if (path.endsWith("/capture")) return Response.json({ error: "PAYPAL_UNREACHABLE", message: "The capture request timed out.",
+      details: { captureRequested: true, debugId: "return-capture-debug" } }, { status: 502 });
+  }, savedCardBuyer, true, { storage: [["editfi:returning:revision-1:saved-card", crypto.randomUUID()]], search: "?saved-card=return" });
+  await page.ready();
+  assert.equal(page.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
+  assert.equal(page.requests.some((request) => request.path === "/api/orders" || request.path === "/api/direct-charge"), false);
+  assert.match(page.element("status").textContent, /The capture request timed out/);
+  assert.match(page.element("status").textContent, /return-capture-debug/);
+  assert.equal(page.element("place-order").disabled, true);
 });
 
 test("an unverified saved card cannot show or use the capture recovery action", async () => {
