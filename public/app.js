@@ -3,6 +3,7 @@ const flow = document.body.dataset.flow;
 let settings, buyer, mounted = false, busy = false, paid = false, unresolved = false, lastOrderId, approvedOrderId, submittingPayment = false;
 let cardFields, cardMounted = false, cardRendering, cardSubmitting = false, cardOrderId, approvedCardOrderId, cardCapturePromise, activeMethod = "paypal";
 let savePayPalChoice = false, saveCardChoice = false, savedCardAuthenticationUrl;
+let savedCardChallengeState, savedCardChallenge;
 let selectedMethod, renderNewPayPalButton, renderCardFields;
 let cardStage = "idle", cardCancelled = false;
 let cardSession, cardFieldElements = [];
@@ -15,7 +16,6 @@ const backendErrors = new WeakSet();
 const context = () => flow === "new" ? "new" : `returning:${buyer?.revision}`;
 const storageKey = (kind) => `editfi:${kind === "card" ? flow : context()}:${kind}`;
 const lastOrderStorageKey = `editfi:last-order:${flow}`;
-const savedCardNavigationKey = "editfi:saved-card-navigation";
 const validOrderId = (value) => typeof value === "string" && /^[A-Z0-9]{8,32}$/i.test(value);
 const placeOrderPrompt = 'Payment method approved. Click "Place order with saved method" to complete the purchase.';
 const savedCard = () => buyer?.methodType === "card";
@@ -33,7 +33,7 @@ function status(message, type = "") {
 }
 
 function resetApiTraces() {
-  for (const kind of ["create", "confirm", "get", "capture"]) {
+  for (const kind of ["create", "get", "capture"]) {
     $(`${kind}-trace`).open = false;
     $(`${kind}-trace-status`).textContent = "Not requested";
     $(`${kind}-request`).textContent = "No request recorded yet.";
@@ -52,7 +52,7 @@ function displayRequest(trace) {
 }
 
 function showApiTraces(traces) {
-  for (const kind of ["create", "confirm", "get", "capture"]) {
+  for (const kind of ["create", "get", "capture"]) {
     const trace = traces[kind];
     if (!trace) continue;
     $(`${kind}-trace`).open = true;
@@ -493,8 +493,6 @@ async function recoverAttempt({ completeSavedCardReturn = false } = {}) {
           // positive confirmation that no capture has already been dispatched.
           const continuePayment = previous.flow === "saved-card" && result.flow === "saved-card" &&
             approvedCardOrderId === previous.order.id && noCardCapture(previous) && noCardCapture(result);
-          let navigation;
-          try { navigation = JSON.parse(sessionStorage.getItem(savedCardNavigationKey)); } catch {}
           const ignoreReasons = [
             (previous.flow !== "saved-card" || result.flow !== "saved-card") && "FLOW_MISMATCH",
             result.order.id !== previous.order.id && "ORDER_MISMATCH",
@@ -505,9 +503,6 @@ async function recoverAttempt({ completeSavedCardReturn = false } = {}) {
             backendCaptureRequest: continuePayment ? "REQUESTED" : "NOT_REQUESTED", ignoreReasons,
             orderStatus: result.order.status ?? null, authenticationResult: cardAuthenticationResult(result.order.payment_source?.card?.authentication_result),
             canContinueAuthentication: Boolean(savedCardAuthenticationUrl),
-            navigationRequested: navigation?.orderID === previous.order.id,
-            ...(navigation?.orderID === previous.order.id ? { navigationRequestedAt: navigation.requestedAt,
-              navigationTarget: navigation.target } : {}),
           });
           if (continuePayment) await captureOrder(approvedCardOrderId);
         }
@@ -577,7 +572,6 @@ async function start() {
     // the shared vaulted method and diagnostic order ID, but discard browser
     // attempt keys so an earlier checkout cannot restore its payment lock.
     for (const kind of ["saved-card", "card", "direct", "component"]) sessionStorage.removeItem(storageKey(kind));
-    sessionStorage.removeItem(savedCardNavigationKey);
     showPaymentDetails(null);
     log("Fresh saved-card checkout", { previousAttemptRestored: false });
   }
@@ -912,6 +906,7 @@ async function restoreCard(result, method = activeMethod.includes("card") ? acti
   const captureEligible = result.order.cardCaptureEligible ?? (result.order.status === "APPROVED" && result.order.cardAuthenticated === true);
   approvedCardOrderId = !alreadyCaptured && captureEligible ? result.order.id : undefined;
   savedCardAuthenticationUrl = method === "saved-card" ? result.order.payerActionUrl : undefined;
+  savedCardChallengeState = method === "saved-card" ? result.order.challengeState : undefined;
   // A confirmed unapproved order can be retried with the SAME create key. A
   // previous capture attempt always keeps the checkout locked for recovery.
   const captureAttempted = result.captureRequested === true || result.traces?.capture?.attempted || result.traces?.capture?.response ||
@@ -1018,19 +1013,26 @@ async function payWithSavedCard() {
   activeMethod = "saved-card";
   cardCaptureAttempted = false;
   cardOrderId = lastOrderId = approvedCardOrderId = savedCardAuthenticationUrl = undefined;
-  sessionStorage.removeItem(savedCardNavigationKey);
   for (const kind of ["card", "component", "direct"]) sessionStorage.removeItem(storageKey(kind));
   resetApiTraces();
   showPaymentDetails(null);
   status("Preparing your saved card for 3D Secure authentication…");
   controls();
   try {
-    const result = await api("/api/orders", { flow: "saved-card", requestId: requestId("saved-card"), vaultRevision: buyer.revision });
+    let result = await api("/api/orders", { flow: "saved-card", requestId: requestId("saved-card"), vaultRevision: buyer.revision });
+    if (result.order.status === "APPROVED" && !result.order.completed && !hasCapture(result.order) &&
+        !result.order.cardCaptureEligible && !result.order.payerActionUrl) {
+      // A minimal approval response may omit 3DS details. Verify that same
+      // order before deciding whether it can be captured without a challenge.
+      const orderID = result.order.id;
+      result = await api(`/api/orders/${encodeURIComponent(orderID)}`);
+      if (result.order.id !== orderID) throw new Error("The server returned a different order during authentication verification.");
+    }
     await restoreCard(result, "saved-card");
     if (savedCardAuthenticationUrl) {
       // The backend validates this PayPal HATEOAS URL and supplies our return
       // URI. No card capture is made before successful issuer authentication.
-      redirectSavedCardTo3DS();
+      openSavedCardChallenge();
     } else if (approvedCardOrderId) {
       await captureOrder(approvedCardOrderId);
     }
@@ -1038,24 +1040,97 @@ async function payWithSavedCard() {
     unresolved = !paid;
     showError(error);
   } finally {
+    busy = submittingPayment = Boolean(savedCardChallenge);
+    controls();
+  }
+}
+
+function openSavedCardChallenge() {
+  if (!savedCardAuthenticationUrl || !cardOrderId || paid || cardCaptureAttempted) return;
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(savedCardChallengeState || "")) {
+    throw new Error("Reload this page to start a saved-card checkout with the current integration.");
+  }
+  if (savedCardChallenge) return;
+  const url = new URL(savedCardAuthenticationUrl);
+  const iframe = document.createElement("iframe");
+  iframe.title = "3D Secure card authentication";
+  iframe.setAttribute("allow", "payment");
+  const challenge = savedCardChallenge = { orderID: cardOrderId, state: savedCardChallengeState, iframe, stage: "challenge" };
+  $("saved-card-3ds-frame").replaceChildren(iframe);
+  $("saved-card-3ds-status").textContent = "Complete authentication with your card issuer.";
+  $("close-saved-card-3ds").disabled = false;
+  $("saved-card-3ds").showModal();
+  iframe.addEventListener("load", () => {
+    if (savedCardChallenge === challenge) log("Saved card 3DS iframe loaded", { orderID: challenge.orderID });
+  });
+  iframe.src = savedCardAuthenticationUrl;
+  busy = submittingPayment = true;
+  controls();
+  log("Saved card 3DS iframe opened", { orderID: cardOrderId, target: `${url.origin}${url.pathname}` });
+}
+
+function closeSavedCardChallenge(challenge) {
+  if (savedCardChallenge !== challenge) return;
+  savedCardChallenge = undefined;
+  $("saved-card-3ds-frame").replaceChildren();
+  $("saved-card-3ds").close();
+}
+
+function cancelSavedCardChallenge() {
+  const challenge = savedCardChallenge;
+  if (!challenge || challenge.stage !== "challenge") return;
+  closeSavedCardChallenge(challenge);
+  sessionStorage.removeItem(storageKey("saved-card"));
+  approvedCardOrderId = savedCardAuthenticationUrl = savedCardChallengeState = undefined;
+  busy = submittingPayment = unresolved = false;
+  log("Saved card 3DS cancelled", { orderID: challenge.orderID });
+  status("Card authentication was closed. No capture was sent. You can start a new payment or choose another method.");
+  controls();
+  $("place-order").focus();
+}
+
+async function savedCardChallengeMessage(event) {
+  const challenge = savedCardChallenge;
+  if (!challenge || challenge.stage !== "challenge" || event.origin !== location.origin ||
+      event.source !== challenge.iframe.contentWindow || event.data?.type !== "editfi:3ds-result" ||
+      event.data.state !== challenge.state || !["return", "cancel"].includes(event.data.result) ||
+      activeMethod !== "saved-card" || cardOrderId !== challenge.orderID || paid) return;
+  if (event.data.result === "cancel") return cancelSavedCardChallenge();
+  challenge.stage = "verification";
+  challenge.iframe.hidden = true;
+  $("close-saved-card-3ds").disabled = true;
+  $("saved-card-3ds-status").textContent = "Verifying authentication with PayPal…";
+  log("Saved card 3DS iframe return", { orderID: challenge.orderID, result: "RETURNED_FOR_SERVER_VERIFICATION" });
+  try {
+    const result = await api(`/api/orders/${encodeURIComponent(challenge.orderID)}`);
+    if (savedCardChallenge !== challenge || cardOrderId !== challenge.orderID) return;
+    if (result.order.id !== challenge.orderID) throw new Error("The server returned a different order during authentication verification.");
+    await restoreCard(result, "saved-card");
+    const capture = approvedCardOrderId === challenge.orderID && result.flow === "saved-card" && noCardCapture(result) && !paid;
+    log("Saved card 3DS capture decision", { orderID: challenge.orderID, backendCaptureRequest: capture ? "REQUESTED" : "NOT_REQUESTED",
+      orderStatus: result.order.status ?? null, authenticationResult: cardAuthenticationResult(result.order.payment_source?.card?.authentication_result) });
+    if (capture) {
+      challenge.stage = "capture";
+      await captureOrder(challenge.orderID);
+    }
+  } catch (error) {
+    unresolved = !paid;
+    showError(error);
+  } finally {
+    closeSavedCardChallenge(challenge);
     busy = submittingPayment = false;
     controls();
   }
 }
 
-function redirectSavedCardTo3DS() {
-  if (!savedCardAuthenticationUrl || !cardOrderId || paid || cardCaptureAttempted) return;
-  const url = new URL(savedCardAuthenticationUrl);
-  // Record only safe navigation metadata. The return parameter by itself
-  // cannot prove that the browser visited or completed the issuer challenge.
-  const navigation = { orderID: cardOrderId, requestedAt: new Date().toISOString(), target: `${url.origin}${url.pathname}` };
-  sessionStorage.setItem(savedCardNavigationKey, JSON.stringify(navigation));
-  log("Saved card 3DS navigation requested", navigation);
-  location.assign(savedCardAuthenticationUrl);
-}
+window.addEventListener("message", savedCardChallengeMessage);
+$("close-saved-card-3ds")?.addEventListener("click", cancelSavedCardChallenge);
+$("saved-card-3ds")?.addEventListener("cancel", (event) => { event.preventDefault(); cancelSavedCardChallenge(); });
 
 $("authenticate-saved-card")?.addEventListener("click", () => {
-  if (savedCardAuthenticationUrl && !paid && !busy && !submittingPayment) redirectSavedCardTo3DS();
+  if (savedCardAuthenticationUrl && !paid && !busy && !submittingPayment) {
+    try { openSavedCardChallenge(); } catch (error) { showError(error); }
+  }
 });
 
 for (const [id, kind] of [["save-paypal", "component"], ["save-card", "card"]]) {

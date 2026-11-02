@@ -15,17 +15,17 @@ async function authenticate(request, env) {
   return mismatch === 0;
 }
 
-function secured(response) {
+function secured(response, frameCallback = false) {
   const result = new Response(response.body, response);
   result.headers.set("Cache-Control", "no-store, private");
   result.headers.set("X-Content-Type-Options", "nosniff");
-  result.headers.set("X-Frame-Options", "DENY");
+  result.headers.set("X-Frame-Options", frameCallback ? "SAMEORIGIN" : "DENY");
   result.headers.set("Referrer-Policy", "no-referrer");
   result.headers.set("X-Robots-Tag", "noindex, nofollow");
   result.headers.set("Cross-Origin-Opener-Policy", "same-origin-allow-popups");
   // Do not constrain PayPal's script/frame/connect origins with an incomplete
   // allowlist. This narrow policy does not interfere with the SDK/paysheet.
-  result.headers.set("Content-Security-Policy", "base-uri 'self'; object-src 'none'; frame-ancestors 'none'");
+  result.headers.set("Content-Security-Policy", `base-uri 'self'; object-src 'none'; frame-ancestors ${frameCallback ? "'self'" : "'none'"}`);
   return result;
 }
 
@@ -75,12 +75,13 @@ export default {
       const pages = {
         "/new-customer": "/new-customer.html",
         "/returning-customer": "/returning-customer.html",
+        "/3ds-return": "/3ds-return.html",
       };
       if (pages[url.pathname]) url.pathname = pages[url.pathname];
-      if (!["/new-customer.html", "/returning-customer.html", "/app.js", "/styles.css"].includes(url.pathname)) {
+      if (!["/new-customer.html", "/returning-customer.html", "/3ds-return.html", "/3ds-return.js", "/app.js", "/styles.css"].includes(url.pathname)) {
         return secured(new Response("Not found.", { status: 404 }));
       }
-      return secured(await env.ASSETS.fetch(new Request(url, request)));
+      return secured(await env.ASSETS.fetch(new Request(url, request)), url.pathname === "/3ds-return.html");
     } catch (error) {
       return secured(errorResponse(error));
     }

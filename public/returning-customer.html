@@ -60,7 +60,6 @@
         <h2 id="api-traces-title">PayPal API requests and responses</h2>
         <p class="supporting">Backend REST requests and PayPal responses for this checkout. The authorization method is shown; Bearer tokens, client secrets, and passwords are redacted.</p>
         <details id="create-trace"><summary><span>Create order</span><span id="create-trace-status" class="muted small">Not requested</span></summary><div class="trace-columns"><div><h3>Request</h3><pre id="create-request">No request recorded yet.</pre></div><div><h3>Response</h3><pre id="create-response">No response recorded yet.</pre></div></div></details>
-        <details id="confirm-trace"><summary><span>Confirm saved card / 3DS</span><span id="confirm-trace-status" class="muted small">Not requested</span></summary><div class="trace-columns"><div><h3>Request</h3><pre id="confirm-request">No request recorded yet.</pre></div><div><h3>Response</h3><pre id="confirm-response">No response recorded yet.</pre></div></div></details>
         <details id="get-trace"><summary><span>Get order / 3DS result</span><span id="get-trace-status" class="muted small">Not requested</span></summary><div class="trace-columns"><div><h3>Request</h3><pre id="get-request">No request recorded yet.</pre></div><div><h3>Response</h3><pre id="get-response">No response recorded yet.</pre></div></div></details>
         <details id="capture-trace"><summary><span>Capture</span><span id="capture-trace-status" class="muted small">Not requested</span></summary><div class="trace-columns"><div><h3>Request</h3><pre id="capture-request">No request recorded yet.</pre></div><div><h3>Response</h3><pre id="capture-response">No response recorded yet.</pre></div></div></details>
       </section>
@@ -68,5 +67,10 @@
     </main>
     <footer><span>PayPal ViewEditFI integration test</span><span>Sandbox transactions only</span></footer>
   </div>
+  <dialog id="saved-card-3ds" class="three-ds-dialog" aria-labelledby="saved-card-3ds-title">
+    <div class="three-ds-heading"><h2 id="saved-card-3ds-title">Verify your card</h2><button id="close-saved-card-3ds" class="text-button" type="button">Close authentication</button></div>
+    <p id="saved-card-3ds-status" class="supporting" role="status">Complete authentication with your card issuer.</p>
+    <div id="saved-card-3ds-frame" class="three-ds-frame"></div>
+  </dialog>
 </body>
 </html>

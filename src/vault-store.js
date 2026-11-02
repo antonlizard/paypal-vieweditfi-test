@@ -36,7 +36,11 @@ function payerActionUrl(order, operation) {
     const url = new URL(href);
     if (url.protocol !== "https:" || url.username || url.password ||
         !(url.hostname === "www.paypal.com" || url.hostname === "sandbox.paypal.com" || url.hostname.endsWith(".sandbox.paypal.com"))) return undefined;
-    url.searchParams.set("redirect_uri", operation.confirmationPayload.payment_source.card.experience_context.return_url);
+    const context = operation.payload.payment_source?.card?.experience_context || operation.confirmationPayload?.payment_source?.card?.experience_context;
+    const callback = new URL("/3ds-return", context.return_url);
+    callback.searchParams.set("state", operation.threeDSState || operation.requestId);
+    callback.searchParams.set("result", "return");
+    url.searchParams.set("redirect_uri", callback.href);
     return url.href;
   } catch { return undefined; }
 }
@@ -54,6 +58,7 @@ function summary(order, operation) {
     id: order.id,
     status: payment.status ?? null,
     completed: isCompleted(payment),
+    ...(operation?.flow === "saved-card" ? { challengeState: operation.threeDSState || operation.requestId } : {}),
     ...(card ? { cardAuthenticated: cardAuthenticated(order), cardCaptureEligible: cardCaptureEligible(payment), payment_source: { card: {
       brand: card.brand, last_digits: card.last_digits, expiry: card.expiry,
       authentication_result: card.authentication_result, attributes: { vault: card.attributes?.vault },
@@ -174,10 +179,11 @@ export class VaultStore {
     // after a completed request can still recover the original outcome.
     if (operation?.result) {
       if (flow === "saved-card" && !operation.result.completed) await this.current(input.vaultRevision);
-      if (flow === "saved-card" && !operation.confirmed) {
-        return this.confirmSavedCard(operation);
-      }
-      return json({ order: operation.result, traces: operation.traces || {}, replayed: true });
+      return json({ order: operation.result, flow: operation.flow, captureRequested: operation.captureRequested === true,
+        traces: operation.traces || {}, replayed: true });
+    }
+    if (operation && flow === "saved-card" && !operation.payload.payment_source?.card) {
+      throw new AppError(409, "LEGACY_CHECKOUT", "Reload the saved-card page to start a new checkout using the current integration.");
     }
     if (operation && Date.now() - Date.parse(operation.createdAt) > 5 * 60 * 60 * 1000) {
       // PayPal's default idempotency retention is finite. An unresolved create
@@ -193,9 +199,10 @@ export class VaultStore {
       const origin = new URL(request.url).origin;
       const page = checkoutPage === "new" ? "new-customer" : "returning-customer";
       const returnParameter = flow === "saved-card" ? "saved-card" : flow === "card" ? "card" : "paypal";
+      const threeDSState = flow === "saved-card" ? crypto.randomUUID() : undefined;
       const experience = {
-        return_url: `${origin}/${page}?${returnParameter}=return`,
-        cancel_url: `${origin}/${page}?${returnParameter}=cancel`,
+        return_url: flow === "saved-card" ? `${origin}/3ds-return?state=${threeDSState}&result=return` : `${origin}/${page}?${returnParameter}=return`,
+        cancel_url: flow === "saved-card" ? `${origin}/3ds-return?state=${threeDSState}&result=cancel` : `${origin}/${page}?${returnParameter}=cancel`,
         shipping_preference: "NO_SHIPPING",
         user_action: flow === "returning" ? "CONTINUE" : "PAY_NOW",
       };
@@ -248,15 +255,15 @@ export class VaultStore {
         savePaymentMethod,
         checkoutPage,
         vaultRevision: input.vaultRevision,
+        ...(threeDSState ? { threeDSState } : {}),
         sequence,
         merchantCustomerId,
         createdAt: new Date().toISOString(),
         payload: {
           intent: "CAPTURE",
           purchase_units: [{ amount: { currency_code: settings.currency, value: settings.amount } }],
-          ...(flow === "saved-card" ? {} : { payment_source: { [flow === "card" ? "card" : "paypal"]: source } }),
+          payment_source: { [["card", "saved-card"].includes(flow) ? "card" : "paypal"]: source },
         },
-        ...(flow === "saved-card" ? { confirmationPayload: { payment_source: { card: source } } } : {}),
       };
       // Persist the exact payload before sending money-related requests. If a
       // response is lost or the object restarts, retry the same PayPal request.
@@ -269,23 +276,8 @@ export class VaultStore {
     operation.orderId = order.id;
     operation.result = summary(order, operation);
     await this.finish(operation, order);
-    if (flow === "saved-card") return this.confirmSavedCard(operation, trace);
-    return json({ order: operation.result, traces: { ...operation.traces, create: trace } });
-  }
-
-  async confirmSavedCard(operation, createTrace) {
-    // Keep creation and payment-source confirmation separate so saving a vault
-    // ID in the request cannot cause a one-step charge before authentication.
-    const { order, trace } = await this.paymentRequest(operation, "confirm", `/v2/checkout/orders/${operation.orderId}/confirm-payment-source`, {
-      method: "POST", body: operation.confirmationPayload, requestId: `confirm-${operation.requestId}`,
-    });
-    if (order.id !== operation.orderId) throw new AppError(502, "INVALID_ORDER_RESPONSE", "PayPal returned a different order during card confirmation.");
-    operation.result = summary(order, operation);
-    operation.confirmed = true;
-    await this.finish(operation, order);
-    return json({ order: operation.result, flow: operation.flow, traces: {
-      ...operation.traces, ...(createTrace ? { create: createTrace } : {}), confirm: trace,
-    } });
+    return json({ order: operation.result, flow: operation.flow, captureRequested: operation.captureRequested === true,
+      traces: { ...operation.traces, create: trace } });
   }
 
   async paymentRequest(operation, kind, path, init) {
@@ -322,6 +314,11 @@ export class VaultStore {
     delete operation.traces?.getDetails;
     const card = ["card", "saved-card"].includes(operation.flow);
     const { order } = await this.paymentRequest(operation, "get", card ? `${path}?fields=payment_source` : path, { method: "GET" });
+    if (order.id !== operation.orderId) {
+      throw new AppError(502, "INVALID_ORDER_RESPONSE", "PayPal returned a different order during the status lookup.", {
+        captureRequested: operation.captureRequested === true, traces: operation.traces,
+      });
+    }
     // An incomplete payment-source projection cannot tell us whether the
     // buyer still needs the issuer challenge. Read the current full order for
     // its status and HATEOAS link; never restore a stale confirmation link.
