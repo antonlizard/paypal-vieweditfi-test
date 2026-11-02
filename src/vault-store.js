@@ -318,6 +318,27 @@ export class VaultStore {
     }
   }
 
+  async readOrder(operation, path) {
+    delete operation.traces?.getDetails;
+    const card = ["card", "saved-card"].includes(operation.flow);
+    const { order } = await this.paymentRequest(operation, "get", card ? `${path}?fields=payment_source` : path, { method: "GET" });
+    // An incomplete payment-source projection cannot tell us whether the
+    // buyer still needs the issuer challenge. Read the current full order for
+    // its status and HATEOAS link; never restore a stale confirmation link.
+    if (operation.flow !== "saved-card" || order.status != null || cardAuthenticated(order)) return order;
+    const known = summary(order, operation);
+    if (known.completed || known.purchase_units?.some((unit) => unit.payments?.captures?.some((item) => item.status === "PENDING"))) return order;
+    const { order: details } = await this.paymentRequest(operation, "getDetails", path, { method: "GET" });
+    if (order.id !== operation.orderId || details.id !== operation.orderId) {
+      throw new AppError(502, "INVALID_ORDER_RESPONSE", "PayPal returned a different order during the card status lookup.", {
+        captureRequested: operation.captureRequested === true, traces: operation.traces,
+      });
+    }
+    return { ...order, ...details, payment_source: { ...order.payment_source, ...details.payment_source,
+      card: { ...order.payment_source?.card, ...details.payment_source?.card },
+    } };
+  }
+
   async order(orderId, capture) {
     const operationKey = await this.storage.get(`order:${orderId}`);
     const operation = operationKey ? await this.storage.get(operationKey) : null;
@@ -332,7 +353,7 @@ export class VaultStore {
     if (capture && ["card", "saved-card"].includes(operation.flow)) {
       // Read authentication from PayPal, never from browser callbacks. This
       // test harness requires a successful 3DS result before a card capture.
-      const { order: verified } = await this.paymentRequest(operation, "get", `${path}?fields=payment_source`, { method: "GET" });
+      const verified = await this.readOrder(operation, path);
       const verifiedSummary = summary(verified, operation);
       const pendingCapture = verifiedSummary.purchase_units?.some((unit) => unit.payments?.captures?.some((item) => item.status === "PENDING"));
       if (verifiedSummary.completed || pendingCapture) {
@@ -360,8 +381,7 @@ export class VaultStore {
     const captured = capture ? await this.paymentRequest(operation, "capture", `${path}/capture`, {
       method: "POST", body: {}, requestId: `capture-${orderId}`,
     }) : null;
-    const order = captured ? captured.order : (await this.paymentRequest(operation, "get",
-      ["card", "saved-card"].includes(operation.flow) ? `${path}?fields=payment_source` : path, { method: "GET" })).order;
+    const order = captured ? captured.order : await this.readOrder(operation, path);
     operation.result = summary(order, operation);
     await this.finish(operation, order);
     return json({

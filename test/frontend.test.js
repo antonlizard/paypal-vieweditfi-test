@@ -106,7 +106,7 @@ function browser(flow, backend = () => undefined, initialBuyer = savedBuyer, has
     location: { search: options.search || "", pathname: `/${flow === "new" ? "new" : "returning"}-customer`, reload() {}, assign(url) { navigations.push(url); } },
     history: { replaceState() {} },
     sessionStorage: { getItem: (key) => storage.get(key) || null, setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) },
-    crypto, URLSearchParams, Intl, Date,
+    crypto, URL, URLSearchParams, Intl, Date,
     console: { info: (...values) => consoleLogs.push(values), error: (...values) => consoleLogs.push(values) },
     fetch: async (path, init) => {
       const body = init.body ? JSON.parse(init.body) : undefined;
@@ -1653,6 +1653,92 @@ test("a saved-card return URL alone cannot start a payment or capture another ca
     await page.ready();
     assert.equal(page.requests.some((request) => request.path === "/api/orders" || request.path.endsWith("/capture")), false);
   }
+});
+
+test("an incomplete saved-card return exposes the current challenge and records navigation without a redirect loop", async () => {
+  const payerActionUrl = "https://www.sandbox.paypal.com/webapps/helios?action=verify&flow=3ds&cart_id=ORDER00001&redirect_uri=https%3A%2F%2Ftest.example%2Freturning-customer%3Fsaved-card%3Dreturn";
+  const first = browser("returning", (path) => {
+    if (path === "/api/orders") return { order: { id: complete.id, status: "PAYER_ACTION_REQUIRED", payerActionUrl } };
+  }, savedCardBuyer);
+  await first.ready();
+  await first.element("place-order").events.click();
+  assert.deepEqual(first.navigations, [payerActionUrl]);
+  const navigation = JSON.parse(first.storage.get("editfi:saved-card-navigation"));
+  assert.equal(navigation.orderID, complete.id);
+  assert.equal(navigation.target, "https://www.sandbox.paypal.com/webapps/helios");
+  assert.equal(JSON.stringify(navigation).includes("redirect_uri"), false);
+  const getTrace = { ...createTrace, request: { ...createTrace.request, method: "GET", url: `https://api-m.sandbox.paypal.com/v2/checkout/orders/${complete.id}?fields=payment_source`, body: null },
+    response: { status: 200, body: { id: complete.id, payment_source: { card: { last_digits: "2503" } } } } };
+  const getDetailsTrace = { ...getTrace, request: { ...getTrace.request, url: `https://api-m.sandbox.paypal.com/v2/checkout/orders/${complete.id}` },
+    response: { status: 200, headers: { "paypal-debug-id": "full-order-debug" }, body: { id: complete.id, status: "PAYER_ACTION_REQUIRED" } } };
+  const returned = browser("returning", (path) => {
+    if (path.startsWith("/api/operations/")) return { flow: "saved-card", order: { id: complete.id }, captureRequested: false };
+    if (path === `/api/orders/${complete.id}`) return { flow: "saved-card", order: {
+      id: complete.id, status: "PAYER_ACTION_REQUIRED", cardAuthenticated: false, cardCaptureEligible: false, payerActionUrl,
+    }, captureRequested: false, traces: { get: getTrace, getDetails: getDetailsTrace } };
+  }, savedCardBuyer, true, { storage: first.storage, search: "?saved-card=return" });
+  await returned.ready();
+  assert.equal(returned.requests.some((request) => request.path.endsWith("/capture") || request.path === "/api/orders"), false);
+  assert.deepEqual(returned.navigations, []);
+  assert.equal(returned.element("authenticate-saved-card").hidden, false);
+  assert.equal(returned.element("authenticate-saved-card").disabled, false);
+  assert.match(returned.element("status").textContent, /No capture was sent.*Continue card authentication/);
+  assert.match(returned.element("activity").textContent, /"navigationRequested": true/);
+  assert.match(returned.element("activity").textContent, /AUTHENTICATION_NOT_CAPTURE_ELIGIBLE/);
+  assert.doesNotMatch(returned.element("activity").textContent, /SavedPaymentMethods rendered|create-access-token|redirect_uri/);
+  assert.match(returned.element("activity").textContent, /Saved card checkout rendered/);
+  const shownRequest = JSON.parse(returned.element("get-request").textContent);
+  assert.equal(shownRequest.fullOrderFollowUp.authentication.token, "[REDACTED]");
+  assert.equal(shownRequest.fullOrderFollowUp.headers.Authorization, "[REDACTED]");
+  assert.equal(JSON.parse(returned.element("get-response").textContent).fullOrderFollowUp.body.status, "PAYER_ACTION_REQUIRED");
+  await returned.element("check-last-order").events.click();
+  const diagnostic = returned.consoleLogs.find(([event]) => event === "Get last order details response")[1];
+  assert.equal(diagnostic.fullOrderFollowUp.body.status, "PAYER_ACTION_REQUIRED");
+  assert.equal(returned.element("authenticate-saved-card").hidden, false);
+  returned.element("authenticate-saved-card").events.click();
+  assert.deepEqual(returned.navigations, [payerActionUrl]);
+  assert.equal(returned.requests.some((request) => request.path.endsWith("/capture") || request.path === "/api/orders"), false);
+  const authenticated = browser("returning", (path) => {
+    if (path.startsWith("/api/operations/")) return { flow: "saved-card", order: { id: complete.id }, captureRequested: false };
+    if (path === `/api/orders/${complete.id}`) return { flow: "saved-card", order: {
+      id: complete.id, status: null, cardAuthenticated: true, cardCaptureEligible: true,
+    }, captureRequested: false };
+  }, savedCardBuyer, true, { storage: returned.storage, search: "?saved-card=return" });
+  await authenticated.ready();
+  assert.equal(authenticated.requests.filter((request) => request.path.endsWith("/capture")).length, 1);
+  assert.equal(authenticated.element("payment-capture-id").textContent, "CAPTURE00001");
+});
+
+test("a saved-card return parameter alone is not logged as proof of challenge navigation or authentication", async () => {
+  const page = browser("returning", (path) => {
+    if (path.startsWith("/api/operations/")) return { flow: "saved-card", order: { id: complete.id }, captureRequested: false };
+    if (path === `/api/orders/${complete.id}`) return { flow: "saved-card", order: {
+      id: complete.id, status: "APPROVED", cardAuthenticated: false, cardCaptureEligible: false,
+    }, captureRequested: false };
+  }, savedCardBuyer, true, { storage: [["editfi:returning:revision-1:saved-card", crypto.randomUUID()]], search: "?saved-card=return" });
+  await page.ready();
+  assert.match(page.element("activity").textContent, /"navigationRequested": false/);
+  assert.match(page.element("activity").textContent, /"authenticationResult": null/);
+  assert.match(page.element("status").textContent, /has not returned successful 3D Secure authentication/);
+  assert.doesNotMatch(page.element("status").textContent, /capture result is not confirmed/);
+  assert.equal(page.requests.some((request) => request.path.endsWith("/capture")), false);
+  assert.deepEqual(page.navigations, []);
+});
+
+test("a failed full saved-card lookup displays its redacted follow-up trace and does not send payment", async () => {
+  const get = { ...savedCreateTrace, request: { ...savedCreateTrace.request, method: "GET" },
+    response: { status: 200, body: { id: complete.id, payment_source: { card: { brand: "VISA" } } } } };
+  const page = browser("returning", (path) => {
+    if (path.startsWith("/api/operations/")) return { flow: "saved-card", order: { id: complete.id }, captureRequested: false };
+    if (path === `/api/orders/${complete.id}`) return Response.json({ error: "PAYPAL_UNREACHABLE", message: "Full order lookup failed.",
+      details: { captureRequested: false, traces: { get, getDetails: { ...get, response: null,
+        error: { code: "PAYPAL_UNREACHABLE", message: "Full order lookup failed." } } } } }, { status: 502 });
+  }, savedCardBuyer, true, { storage: [["editfi:returning:revision-1:saved-card", crypto.randomUUID()]], search: "?saved-card=return" });
+  await page.ready();
+  assert.match(page.element("get-response").textContent, /Full order lookup failed/);
+  assert.match(page.element("get-trace-status").textContent, /full order failed/);
+  assert.equal(page.requests.some((request) => request.path.endsWith("/capture") || request.path === "/api/orders"), false);
+  assert.deepEqual(page.navigations, []);
 });
 
 test("a saved-card return restores pending captures without dispatching again", async () => {
