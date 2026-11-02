@@ -235,7 +235,7 @@ async function finish(result) {
   }
   if (paid) {
     const saving = flow === "new" && (activeMethod === "card" ? saveCardChoice : savePayPalChoice);
-    const message = activeMethod.includes("card") ? `Card payment completed. Capture ID - ${captureIds.join(", ") || "—"}.` : `Payment completed. Order ${order.id}.`;
+    const message = `${activeMethod.includes("card") ? "Card payment" : "Payment"} completed. Transaction ID (Capture ID) - ${captureIds.join(", ") || "—"}.`;
     status(`${message}${saving && current && current.buyer?.state !== "VAULTED" ? " Vaulting is pending; refresh the saved method before using it." : ""}`, "success");
   } else {
     status(`Order ${order.id}: ${order.status || "status not returned"}. Payment is not confirmed. Check its status before starting another purchase.`);
